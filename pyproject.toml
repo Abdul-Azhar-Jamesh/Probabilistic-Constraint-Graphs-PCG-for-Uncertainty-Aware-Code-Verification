@@ -1,0 +1,55 @@
+[project]
+name = "pcg"
+version = "0.1.0"
+description = "Probabilistic Constraint Graphs for uncertainty-aware verification of LLM-generated code"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "rich>=13.0",
+    "pylint>=3.0",
+    "scikit-learn>=1.3",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+app = [
+    "streamlit>=1.30",
+    "plotly>=5.18",
+]
+llm = [
+    "transformers>=4.35",
+    "torch>=2.0",
+]
+dev = [
+    "pytest>=7.4",
+    "mypy>=1.8",
+    "ruff>=0.5",
+    "vulture>=2.11",
+    "types-networkx>=3.4",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pcg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The suite imports `pcg` from the repo root. pytest only prepends the test
+# file's own directory to sys.path, so without this the whole suite fails to
+# collect unless the package happens to be pip-installed.
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["pcg"]
+
+# scikit-learn ships no py.typed marker and typeshed publishes no stubs for it,
+# so these imports are unresolvable by design rather than a missing dev install.
+[[tool.mypy.overrides]]
+module = ["sklearn.*"]
+ignore_missing_imports = true

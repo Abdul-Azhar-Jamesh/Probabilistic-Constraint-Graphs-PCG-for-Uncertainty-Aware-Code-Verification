@@ -1,0 +1,49 @@
+{
+  "metrics": {
+    "tp": 35,
+    "fp": 33,
+    "tn": 7,
+    "fn": 5,
+    "n": 80,
+    "accuracy": 0.525,
+    "precision": 0.5147058823529411,
+    "recall": 0.875,
+    "f1": 0.6481481481481481
+  },
+  "brier_score": 0.35320628749999994,
+  "ece": 0.28708749999999994,
+  "reliability_bins": [
+    {
+      "range": "0.50-0.60",
+      "n": 0,
+      "avg_confidence": null,
+      "accuracy": null
+    },
+    {
+      "range": "0.60-0.70",
+      "n": 0,
+      "avg_confidence": null,
+      "accuracy": null
+    },
+    {
+      "range": "0.70-0.80",
+      "n": 43,
+      "avg_confidence": 0.751,
+      "accuracy": 0.6046511627906976
+    },
+    {
+      "range": "0.80-0.90",
+      "n": 25,
+      "avg_confidence": 0.84744,
+      "accuracy": 0.52
+    },
+    {
+      "range": "0.90-1.00",
+      "n": 12,
+      "avg_confidence": 0.9573333333333331,
+      "accuracy": 0.25
+    }
+  ],
+  "suggested_weight": 0.0,
+  "dropped": 0
+}

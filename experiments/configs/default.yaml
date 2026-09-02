@@ -1,0 +1,11 @@
+project:
+  name: pcg
+  version: 0.1.0
+
+pipeline:
+  use_critic: false
+  threshold: 0.5
+
+calibration:
+  dataset: critic_calibration/calibration_dataset.json
+  output: out/fitted_weights.json

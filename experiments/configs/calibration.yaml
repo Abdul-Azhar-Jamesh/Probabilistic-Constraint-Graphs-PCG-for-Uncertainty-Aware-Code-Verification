@@ -1,0 +1,14 @@
+project:
+  name: pcg
+  version: 0.1.0
+
+calibration:
+  source: critic_calibration/calibration_results.json
+  groups: [project, bug_id]
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1
+    - brier
+    - ece

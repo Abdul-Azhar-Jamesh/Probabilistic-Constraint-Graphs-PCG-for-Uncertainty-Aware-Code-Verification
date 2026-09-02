@@ -1,0 +1,28 @@
+{
+  "source_reliability_handtuned": {
+    "compile": 3.2,
+    "exec": 2.8,
+    "static": 1.4,
+    "llm": 0.45
+  },
+  "source_reliability_fitted": {
+    "compile": 0.0,
+    "static": 0.2832,
+    "exec": 3.0608,
+    "llm": 0.0,
+    "critic": 0.0039
+  },
+  "prior_coefficients_handtuned": {
+    "log_cyclomatic": 0.22,
+    "log_loc": 0.03,
+    "depth": 0.1,
+    "n_params": 0.05
+  },
+  "prior_coefficients_fitted": {
+    "log_cyclomatic": -0.2262,
+    "log_loc": 0.8122,
+    "depth": 0.3298,
+    "n_params": 0.3478,
+    "intercept": 3.3845
+  }
+}
