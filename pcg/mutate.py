@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -163,6 +164,42 @@ class _MutationVisitor(ast.NodeTransformer):
 
 
 OPERATORS = ["boundary", "arithmetic", "offbyone", "dropguard", "swapargs"]
+FAULT_OPERATORS = ["syntax", "undefined_name", "wrong_arg_count", "import_error"]
+
+
+def generate_fault_mutants(
+    program: str, source: str, tests: str
+) -> list[Mutant]:
+    """Generate compile and runtime faults absent from AST-preserving mutants."""
+    match = re.search(r"^(def|async def)\s+(\w+)\s*\([^\n]*\):", source, re.MULTILINE)
+    if not match:
+        return []
+    function = match.group(2)
+    line_end = match.end()
+    insertion = {
+        "undefined_name": "\n    __pcg_undefined_name__",
+        "wrong_arg_count": "\n    len()",
+        "import_error": "\n    import __pcg_missing_dependency__",
+    }
+    mutants: list[Mutant] = []
+    for operator, statement in insertion.items():
+        mutants.append(Mutant(
+            case_id=f"{program}:{operator}:0", program=program,
+            operator=operator, source=source[:line_end] + statement + source[line_end:],
+            tests=tests, buggy_block=function, description=operator.replace("_", " "),
+            lineno=source[:line_end].count("\n") + 1,
+        ))
+    syntax_source = re.sub(
+        rf"^(def|async def)\s+{re.escape(function)}\s*\([^\n]*\):",
+        rf"\1 {function}(:", source, count=1, flags=re.MULTILINE,
+    )
+    mutants.append(Mutant(
+        case_id=f"{program}:syntax:0", program=program, operator="syntax",
+        source=syntax_source, tests=tests, buggy_block=function,
+        description="malformed function signature",
+        lineno=source[:line_end].count("\n") + 1,
+    ))
+    return mutants
 
 
 def _enclosing_function(tree: ast.AST, lineno: int) -> str | None:
@@ -270,6 +307,7 @@ def build_corpus(
                 print(f"  [skip] reference program '{name}' fails its own tests")
             continue
         muts = generate_mutants(name, src, tests, max_per_operator)
+        muts.extend(generate_fault_mutants(name, src, tests))
         n_generated += len(muts)
         for m in muts:
             if is_detectable(m.source, m.tests):

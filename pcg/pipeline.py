@@ -35,7 +35,22 @@ def analyze(
     critic_backend: str | None = None,
 ) -> Analysis:
     """Run the full PCG pipeline over one Python source string."""
-    blocks = extract_blocks(source)
+    try:
+        blocks = extract_blocks(source)
+    except SyntaxError:
+        # Preserve a reportable block when the AST cannot be built, so the
+        # compiler sensor can still communicate that the whole module is bad.
+        blocks = [
+            Block(
+                bid="module:syntax-error",
+                kind="module",
+                name="<syntax error>",
+                qualname="<syntax error>",
+                lineno=1,
+                end_lineno=max(1, source.count("\n") + 1),
+                source=source,
+            )
+        ]
     if not blocks:
         raise ValueError("no analysable blocks found in source")
     g = build_graph(blocks)

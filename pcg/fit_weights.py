@@ -31,7 +31,29 @@ from .evaluate import Case, evaluate
 from .inference import (
     expected_calibration_error,
     brier_score,
+    selected_threshold_from_validation,
+    save_selected_thresholds,
 )
+
+
+def _sensor_likelihood_ratios(
+    features: list[BlockFeatures], smoothing: float = 1.0,
+    compile_floor: float = 1.5,
+) -> dict[str, float]:
+    """Estimate defect signal as a smoothed class-conditional likelihood ratio."""
+    ratios: dict[str, float] = {}
+    for source in ("compile", "static", "exec", "llm", "critic"):
+        present = [
+            getattr(feature, f"{source}_neg_weight_sum") > 0
+            for feature in features
+        ]
+        correct = [value for value, feature in zip(present, features) if feature.label == 1]
+        defective = [value for value, feature in zip(present, features) if feature.label == 0]
+        p_correct = (sum(correct) + smoothing) / (len(correct) + 2 * smoothing)
+        p_defective = (sum(defective) + smoothing) / (len(defective) + 2 * smoothing)
+        ratios[source] = max(0.0, float(np.log(p_defective / p_correct)))
+    ratios["compile"] = max(compile_floor, ratios["compile"])
+    return {source: round(value, 4) for source, value in ratios.items()}
 
 
 def _features_to_arrays(
@@ -47,6 +69,25 @@ def _features_to_arrays(
     return X, y
 
 
+def _grouped_cv_predict(
+    features: list[BlockFeatures], feature_names: list[str], C: float = 1.0
+) -> np.ndarray:
+    """Return out-of-group predictions, keeping program/family variants together."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GroupKFold, cross_val_predict
+
+    X, y = _features_to_arrays(features, feature_names)
+    groups = np.array([":".join(f.case_id.split(":")[:2]) for f in features])
+    n_splits = min(5, len(set(groups)))
+    if n_splits < 2:
+        return LogisticRegression(penalty="l2", C=C, max_iter=1000).fit(X, y).predict_proba(X)[:, 1]
+    cv = GroupKFold(n_splits=n_splits)
+    return cross_val_predict(
+        LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs"),
+        X, y, cv=cv, groups=groups, method="predict_proba",
+    )[:, 1]
+
+
 def fit_prior(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any]:
     """Fit the structural prior model.
 
@@ -55,19 +96,13 @@ def fit_prior(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any]:
     the hand-set 0.22, 0.030, 0.10, 0.05 in prior_correctness().
     """
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
-
     X, y = _features_to_arrays(features, STRUCTURAL_FEATURE_NAMES)
 
     clf = LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs")
     clf.fit(X, y)
 
     # 5-fold CV for honest evaluation
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    y_prob_cv = cross_val_predict(
-        LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs"),
-        X, y, cv=cv, method="predict_proba",
-    )[:, 1]
+    y_prob_cv = _grouped_cv_predict(features, STRUCTURAL_FEATURE_NAMES, C)
     y_pred_cv = (y_prob_cv >= 0.5).astype(int)
 
     accuracy_cv = (y_pred_cv == y).mean()
@@ -101,18 +136,12 @@ def fit_evidence(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any
     The fitted coefficients on *_neg_weight_sum map to SOURCE_RELIABILITY.
     """
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
-
     X, y = _features_to_arrays(features, EVIDENCE_FEATURE_NAMES)
 
     clf = LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs")
     clf.fit(X, y)
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    y_prob_cv = cross_val_predict(
-        LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs"),
-        X, y, cv=cv, method="predict_proba",
-    )[:, 1]
+    y_prob_cv = _grouped_cv_predict(features, EVIDENCE_FEATURE_NAMES, C)
     y_pred_cv = (y_prob_cv >= 0.5).astype(int)
 
     accuracy_cv = (y_pred_cv == y).mean()
@@ -123,19 +152,7 @@ def fit_evidence(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any
     coefs = dict(zip(EVIDENCE_FEATURE_NAMES, clf.coef_[0].tolist()))
     intercept = float(clf.intercept_[0])
 
-    # Derive SOURCE_RELIABILITY-compatible values from the negative weight sum
-    # coefficients. The LR coefficient for *_neg_weight_sum is the log-odds
-    # change per unit of negative evidence weight — precisely the quantity
-    # SOURCE_RELIABILITY encodes, modulo the sign flip because negative evidence
-    # lowers P(correct), so the learned coefficient is negative.
-    reliability = {}
-    for src in ("compile", "static", "exec", "llm", "critic"):
-        key = f"{src}_neg_weight_sum"
-        reliability[src] = round(abs(coefs.get(key, 0.0)), 4)
-
-    # The critic source is not always present in the training corpus, so leave
-    # it at a conservative fallback when the fit does not learn a coefficient.
-    reliability.setdefault("critic", 0.25)
+    reliability = _sensor_likelihood_ratios(features)
 
     return {
         "model": "evidence",
@@ -153,24 +170,24 @@ def fit_evidence(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any
         "cv_ece": float(ece_cv),
         "cv_brier": float(brier_cv),
         "source_reliability_fitted": reliability,
+        "validation_posterior_threshold": selected_threshold_from_validation(
+            list(zip(y_prob_cv.tolist(), y.tolist()))
+        ),
+        "validation_culpability_threshold": selected_threshold_from_validation(
+            list(zip((1 - y_prob_cv).tolist(), (1 - y).tolist()))
+        ),
     }
 
 
 def fit_joint(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any]:
     """Fit a joint model on all features for comparison."""
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
-
     X, y = _features_to_arrays(features, ALL_FEATURE_NAMES)
 
     clf = LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs")
     clf.fit(X, y)
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    y_prob_cv = cross_val_predict(
-        LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs"),
-        X, y, cv=cv, method="predict_proba",
-    )[:, 1]
+    y_prob_cv = _grouped_cv_predict(features, ALL_FEATURE_NAMES, C)
     y_pred_cv = (y_prob_cv >= 0.5).astype(int)
 
     accuracy_cv = (y_pred_cv == y).mean()
@@ -398,6 +415,15 @@ def main() -> None:
     print("\n[4/5] Extracting fitted weights...")
     fitted_weights = extract_fitted_weights(prior_result, evidence_result)
     save_fitted_weights(fitted_weights)
+    save_selected_thresholds(
+        evidence_result["validation_posterior_threshold"],
+        evidence_result["validation_culpability_threshold"],
+    )
+    print(
+        "  Validation thresholds: "
+        f"posterior={evidence_result['validation_posterior_threshold']:.2f}, "
+        f"culpability={evidence_result['validation_culpability_threshold']:.2f}"
+    )
 
     # Print comparison table of old vs new weights
     print("\n  SOURCE_RELIABILITY comparison:")

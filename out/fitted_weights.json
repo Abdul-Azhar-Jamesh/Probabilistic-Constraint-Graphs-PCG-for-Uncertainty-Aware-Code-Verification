@@ -6,11 +6,11 @@
     "llm": 0.45
   },
   "source_reliability_fitted": {
-    "compile": 0.0,
-    "static": 0.2832,
-    "exec": 3.0608,
+    "compile": 1.5,
+    "static": 0.0,
+    "exec": 0.0,
     "llm": 0.0,
-    "critic": 0.0039
+    "critic": 0.0
   },
   "prior_coefficients_handtuned": {
     "log_cyclomatic": 0.22,
@@ -19,10 +19,10 @@
     "n_params": 0.05
   },
   "prior_coefficients_fitted": {
-    "log_cyclomatic": -0.2262,
-    "log_loc": 0.8122,
-    "depth": 0.3298,
-    "n_params": 0.3478,
-    "intercept": 3.3845
+    "log_cyclomatic": -1.0353,
+    "log_loc": 1.9611,
+    "depth": 0.0197,
+    "n_params": -0.0876,
+    "intercept": 3.8103
   }
 }

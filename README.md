@@ -81,6 +81,8 @@ Correct reference programs (located in the `REFERENCE_PROGRAMS` dictionary in `p
 - **`offbyone`**: Adjusts integer constants (e.g., `+1` or `-1`).
 - **`dropguard`**: Removes early-return guard clauses.
 - **`swapargs`**: Swaps the arguments of non-commutative function calls.
+- **`syntax`**, **`undefined_name`**, **`wrong_arg_count`**, and **`import_error`**:
+  add compile-time and runtime faults with known labels.
 
 Mutants are ran against the reference test suite. Equivalent mutants (those that still pass all tests) are discarded, ensuring all corpus mutants are **detectable**.
 
@@ -90,9 +92,19 @@ Features are extracted for each block across all mutants, compiling both:
 - **Evidence Features**: Counts and weight sums of compile, static, execution, and LLM evidence.
 
 ### 3. Model Calibration (`fit_weights.py` / `calibrate.py`)
-Logistic regression models are trained on the training set to replace hand-tuned weights:
+Sensor strengths are estimated from smoothed class-conditional likelihood ratios
+``log(P(E | correct) / P(E | defective))``; compiler evidence has a minimum
+reliability floor. Logistic regression remains available for comparison and
+prior fitting. Validation predictions use grouped splits by reference program
+and mutation family, and posterior and culpability thresholds are selected
+separately on validation data before held-out reporting:
 1. **Prior Model**: Predicts correctness prior using structural features.
-2. **Evidence Model**: Learns the log-odds impact (reliabilities) of different evidence sources.
+2. **Evidence Model**: Reports sensor likelihood-ratio strengths.
+3. **Thresholds**: Selects independent posterior and culpability cutoffs.
+
+The mock critic remains a development substitute rather than validation of a
+real LLM reviewer; it is kept at zero or near-zero weight until evaluated on
+real labeled bugs.
 
 ---
 
@@ -102,6 +114,12 @@ Logistic regression models are trained on the training set to replace hand-tuned
 Ensure you have the required dependencies:
 ```bash
 pip install -r requirements.txt
+```
+
+To install the optional dashboard, real Claude critic, and calibration tools
+from the package metadata:
+```bash
+pip install -e ".[app,critic,calibration]"
 ```
 
 ### Regenerating the Corpus Cache
@@ -148,7 +166,7 @@ python -m pcg.calibrate
 ```
 
 ### Running the Evaluation Harness
-By default this scores against the **auto-generated mutation corpus** — detectable mutants across all reference programs plus the clean reference programs as all-correct examples — rather than hand-labeled cases. The corpus is built and cached by `load_mutant_corpus()` in `mutate.py`, which is the single source of truth called by both `evaluate.py` and the calibration pipeline.
+By default this scores against three built-in, hand-labelled cases covering statistics, search, and text-processing defects. The mutation corpus is used by the calibration pipeline; the evaluator and calibration runner are currently separate workflows.
 ```bash
 python -m pcg.evaluate
 ```

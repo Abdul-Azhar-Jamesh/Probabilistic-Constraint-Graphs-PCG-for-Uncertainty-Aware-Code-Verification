@@ -315,7 +315,7 @@ with tab_map:
     )
     scat = px.scatter(
         df,
-        x="P(correct)",
+        x="Effective Trust",
         y="importance",
         size=[max(0.02, v) for v in df["own doubt"]],
         color="band",

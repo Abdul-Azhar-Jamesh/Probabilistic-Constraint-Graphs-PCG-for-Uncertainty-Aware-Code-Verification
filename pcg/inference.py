@@ -68,8 +68,8 @@ def load_selected_threshold(default: float = 0.5) -> float:
     try:
         with open(SELECTED_THRESHOLD_PATH, encoding="utf-8") as fh:
             payload = json.load(fh)
-        if isinstance(payload, dict) and "selected_threshold" in payload:
-            value = payload["selected_threshold"]
+        if isinstance(payload, dict):
+            value = payload.get("posterior_threshold", payload.get("selected_threshold"))
             if isinstance(value, (int, float)):
                 return float(value)
     except (json.JSONDecodeError, OSError):
@@ -577,6 +577,19 @@ def save_selected_threshold(threshold: float, out_dir: str = "out") -> None:
     path = os.path.join(out_dir, "selected_threshold.json")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"selected_threshold": float(threshold), "metric": "f1"}, fh, indent=2)
+
+
+def save_selected_thresholds(
+    posterior_threshold: float, culpability_threshold: float, out_dir: str = "out"
+) -> None:
+    """Persist independently selected validation thresholds."""
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "selected_threshold.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "posterior_threshold": float(posterior_threshold),
+            "culpability_threshold": float(culpability_threshold),
+            "metric": "f1",
+        }, fh, indent=2)
 
 
 def expected_calibration_error(

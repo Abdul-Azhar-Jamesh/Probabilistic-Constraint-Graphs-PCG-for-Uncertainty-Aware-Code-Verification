@@ -17,7 +17,7 @@ import os
 import pickle
 from dataclasses import asdict, dataclass
 
-from .blocks import extract_blocks
+from .blocks import Block, extract_blocks
 from .corpus import REFERENCE_PROGRAMS
 from .evidence import collect_all
 from .mutate import Mutant, annotate_downstream, build_corpus
@@ -156,7 +156,12 @@ def _extract_block_features(
     try:
         blocks = extract_blocks(source)
     except SyntaxError:
-        return []
+        blocks = [Block(
+            bid=f"function:{next(iter(buggy_qualnames), '<syntax error>')}",
+            kind="function", name=next(iter(buggy_qualnames), "<syntax error>"),
+            qualname=next(iter(buggy_qualnames), "<syntax error>"), lineno=1,
+            end_lineno=max(1, source.count("\n") + 1), source=source,
+        )]
 
     if not blocks:
         return []

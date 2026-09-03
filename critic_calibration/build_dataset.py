@@ -63,10 +63,14 @@ def extract_hunks(patch_path: Path):
             continue  # we want production code, not the test suite itself
 
         for hunk in patched_file:
-            removed = [l.value.rstrip("\n") for l in hunk.source_lines() if l.is_removed or l.is_context]
-            added = [l.value.rstrip("\n") for l in hunk.target_lines() if l.is_added or l.is_context]
+            removed = [line.value.rstrip("\n") for line in hunk.source_lines() if line.is_removed or line.is_context]
+            added = [line.value.rstrip("\n") for line in hunk.target_lines() if line.is_added or line.is_context]
 
-            changed_lines = [l.value for l in hunk if (l.is_added or l.is_removed) and not is_trivial_line(l.value)]
+            changed_lines = [
+                line.value
+                for line in hunk
+                if (line.is_added or line.is_removed) and not is_trivial_line(line.value)
+            ]
             if len(changed_lines) < 1:
                 continue  # nothing substantive changed in this hunk
             if len("\n".join(removed)) < 40 or len("\n".join(added)) < 40:

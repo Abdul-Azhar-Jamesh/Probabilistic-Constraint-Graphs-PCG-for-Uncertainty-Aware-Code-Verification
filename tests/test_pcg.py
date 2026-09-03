@@ -208,6 +208,13 @@ class TestInference:
         a = analyze(SIMPLE)
         assert all(0.0 <= bp.posterior <= 1.0 for bp in a.posteriors.values())
 
+    def test_analyze_reports_malformed_source(self):
+        a = analyze("def broken(:\n    pass\n")
+        assert len(a.blocks) == 1
+        assert a.blocks[0].qualname == "<syntax error>"
+        assert any(e.kind == "syntax_error" for e in a.evidence)
+        assert a.posteriors[a.blocks[0].bid].posterior < 0.5
+
     def test_syntax_error_tanks_confidence(self):
         blocks = extract_blocks(SIMPLE)
         g = build_graph(blocks)
@@ -318,6 +325,22 @@ class TestCalibration:
         loaded = inference._load_fitted_weights()
         assert loaded is not None
         assert loaded["source_reliability_fitted"]["critic"] == 0.25
+
+    def test_sensor_likelihood_ratios_have_compile_floor(self):
+        from pcg.build_training_set import BlockFeatures
+        from pcg.fit_weights import _sensor_likelihood_ratios
+
+        features = [BlockFeatures("clean", "f", 1), BlockFeatures("bug", "f", 0)]
+        ratios = _sensor_likelihood_ratios(features)
+        assert ratios["compile"] >= 1.5
+
+    def test_fault_mutants_cover_nonsemantic_failures(self):
+        from pcg.mutate import generate_fault_mutants
+
+        mutants = generate_fault_mutants("demo", SIMPLE, "")
+        assert {m.operator for m in mutants} == {
+            "syntax", "undefined_name", "wrong_arg_count", "import_error"
+        }
 
     def test_training_labels_keep_downstream_separate_from_bug_label(self):
         from pcg.build_training_set import _extract_block_features

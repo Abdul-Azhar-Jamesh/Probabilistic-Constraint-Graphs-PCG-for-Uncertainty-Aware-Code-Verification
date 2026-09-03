@@ -14,5 +14,9 @@ plotly>=5.18
 # transformers>=4.35
 # torch>=2.0
 
+# Optional: Anthropic critic and BugsInPy calibration dataset
+# anthropic>=0.40
+# unidiff>=0.7
+
 # Dev / tests
 pytest>=7.4

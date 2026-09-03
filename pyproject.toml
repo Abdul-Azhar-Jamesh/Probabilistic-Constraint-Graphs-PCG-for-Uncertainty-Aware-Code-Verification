@@ -22,6 +22,12 @@ llm = [
     "transformers>=4.35",
     "torch>=2.0",
 ]
+critic = [
+    "anthropic>=0.40",
+]
+calibration = [
+    "unidiff>=0.7",
+]
 dev = [
     "pytest>=7.4",
     "mypy>=1.8",

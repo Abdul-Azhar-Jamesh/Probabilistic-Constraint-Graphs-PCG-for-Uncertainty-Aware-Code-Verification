@@ -1,0 +1,5 @@
+{
+  "posterior_threshold": 0.55,
+  "culpability_threshold": 0.4,
+  "metric": "f1"
+}
