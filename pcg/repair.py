@@ -33,15 +33,12 @@ from __future__ import annotations
 
 import ast
 import os
-import shutil
-import subprocess
-import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .blocks import Block, extract_blocks
 from .inference import BlockPosterior
+from .execution import ExecutionConfig, preserves_tests, run_tests
 
 
 @dataclass
@@ -81,8 +78,12 @@ _CMP_ALTERNATIVES: dict[type[ast.cmpop], list[type[ast.cmpop]]] = {
     ast.NotEq: [ast.Eq],
 }
 _CMP_SYM: dict[type[ast.cmpop], str] = {
-    ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
-    ast.Eq: "==", ast.NotEq: "!=",
+    ast.Lt: "<",
+    ast.LtE: "<=",
+    ast.Gt: ">",
+    ast.GtE: ">=",
+    ast.Eq: "==",
+    ast.NotEq: "!=",
 }
 
 _BIN_ALTERNATIVES: dict[type[ast.operator], list[type[ast.operator]]] = {
@@ -93,7 +94,11 @@ _BIN_ALTERNATIVES: dict[type[ast.operator], list[type[ast.operator]]] = {
     ast.FloorDiv: [ast.Div],
 }
 _BIN_SYM: dict[type[ast.operator], str] = {
-    ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.FloorDiv: "//",
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
 }
 
 
@@ -358,9 +363,14 @@ def propose_patches(
                     continue
                 add(
                     Patch(
-                        bid=block.bid, qualname=block.qualname, operator=kind,
-                        description=rw.detail, lineno=rw.lineno, source=patched,
-                        before=rw.before, after=rw.after,
+                        bid=block.bid,
+                        qualname=block.qualname,
+                        operator=kind,
+                        description=rw.detail,
+                        lineno=rw.lineno,
+                        source=patched,
+                        before=rw.before,
+                        after=rw.after,
                     )
                 )
             if exhausted:
@@ -387,9 +397,14 @@ def propose_patches(
                     continue
                 add(
                     Patch(
-                        bid=block.bid, qualname=block.qualname, operator=kind,
-                        description=rw.detail, lineno=rw.lineno, source=patched,
-                        before=rw.before, after=rw.after,
+                        bid=block.bid,
+                        qualname=block.qualname,
+                        operator=kind,
+                        description=rw.detail,
+                        lineno=rw.lineno,
+                        source=patched,
+                        before=rw.before,
+                        after=rw.after,
                     )
                 )
             if exhausted:
@@ -414,9 +429,14 @@ def propose_patches(
                 continue
             add(
                 Patch(
-                    bid=block.bid, qualname=block.qualname, operator="guard",
-                    description=gi.detail, lineno=gi.lineno, source=patched,
-                    before="(none)", after=gi.detail,
+                    bid=block.bid,
+                    qualname=block.qualname,
+                    operator="guard",
+                    description=gi.detail,
+                    lineno=gi.lineno,
+                    source=patched,
+                    before="(none)",
+                    after=gi.detail,
                 )
             )
 
@@ -432,35 +452,11 @@ def propose_patches(
 # Validation
 # --------------------------------------------------------------------------
 def _run_tests(source: str, tests: str, timeout: int = 25) -> tuple[int, int]:
-    """Return (passed, failed). A hang counts as a failure, not a pass."""
-    import re
-
-    wd = tempfile.mkdtemp(prefix="repair_")
-    try:
-        with open(os.path.join(wd, "candidate.py"), "w", encoding="utf-8") as fh:
-            fh.write(source)
-        with open(os.path.join(wd, "test_candidate.py"), "w", encoding="utf-8") as fh:
-            fh.write(tests)
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "test_candidate.py", "-q",
-             "--no-header", "-p", "no:cacheprovider"],
-            capture_output=True, text=True, cwd=wd, timeout=timeout,
-        )
-        out = proc.stdout + proc.stderr
-        passed = failed = 0
-        for m in re.finditer(r"(\d+)\s+(passed|failed|error|errors)\b", out):
-            n, what = int(m.group(1)), m.group(2)
-            if what == "passed":
-                passed += n
-            else:
-                failed += n
-        return passed, failed
-    except subprocess.TimeoutExpired:
-        return 0, 1
-    except Exception:
-        return 0, 1
-    finally:
-        shutil.rmtree(wd, ignore_errors=True)
+    """Compatibility counts from structured results; errors never count as success."""
+    result = run_tests(source, tests, ExecutionConfig(timeout=timeout))
+    return len(result.passed_ids), len(result.failed_ids) if result.valid else max(
+        1, len(result.failed_ids)
+    )
 
 
 @dataclass
@@ -515,6 +511,7 @@ def repair(
     max_patches: int = 60,
     surprisal: dict[str, list[int]] | None = None,
     verbose: bool = False,
+    execution: ExecutionConfig | None = None,
 ) -> list[RepairResult]:
     """Attempt validated repairs on the most culpable blocks.
 
@@ -527,8 +524,9 @@ def repair(
     blocks = blocks if blocks is not None else extract_blocks(source)
     by_bid = {b.bid: b for b in blocks}
 
-    base_pass, base_fail = _run_tests(source, tests)
-    if base_fail == 0:
+    baseline = run_tests(source, tests, execution)
+    base_pass, base_fail = len(baseline.passed_ids), len(baseline.failed_ids)
+    if not baseline.valid or base_fail == 0:
         return []
 
     ranked = sorted(
@@ -543,13 +541,13 @@ def repair(
         if blk is None or blk.kind not in ("function", "method"):
             continue
         res = RepairResult(
-            target_bid=bp.bid, target_qualname=blk.qualname,
+            target_bid=bp.bid,
+            target_qualname=blk.qualname,
             culpability=bp.culpability,
-            baseline_passed=base_pass, baseline_failed=base_fail,
+            baseline_passed=base_pass,
+            baseline_failed=base_fail,
         )
-        cands = propose_patches(
-            source, blk, (surprisal or {}).get(bp.bid), max_patches
-        )
+        cands = propose_patches(source, blk, (surprisal or {}).get(bp.bid), max_patches)
         # Validation is subprocess-bound, so threads give real parallelism here
         # despite the GIL. We evaluate in chunks and stop at the first complete
         # fix, so a patch found early still avoids the remaining test runs.
@@ -557,11 +555,16 @@ def repair(
         for start in range(0, len(cands), chunk):
             batch = cands[start : start + chunk]
             with ThreadPoolExecutor(max_workers=chunk) as pool:
-                outcomes = list(pool.map(lambda p: _run_tests(p.source, tests), batch))
+                outcomes = list(
+                    pool.map(lambda p: run_tests(p.source, tests, execution), batch)
+                )
             res.attempted += len(batch)
             found = False
-            for p, (passed, failed) in zip(batch, outcomes):
+            for p, outcome in zip(batch, outcomes):
+                passed, failed = len(outcome.passed_ids), len(outcome.failed_ids)
                 p.tests_passed, p.tests_failed = passed, failed
+                if not preserves_tests(baseline, outcome):
+                    continue
                 verdict = _verdict(passed, failed, base_pass, base_fail)
                 if verdict is None:
                     continue
@@ -569,8 +572,10 @@ def repair(
                 p.verdict = verdict
                 res.accepted.append(p)
                 if verbose:
-                    print(f"  [{verdict}] {blk.qualname}: {p.description} "
-                          f"({base_pass}P/{base_fail}F -> {passed}P/{failed}F)")
+                    print(
+                        f"  [{verdict}] {blk.qualname}: {p.description} "
+                        f"({base_pass}P/{base_fail}F -> {passed}P/{failed}F)"
+                    )
                 # A full fix ends the search; a partial one is worth reporting
                 # but we keep looking in case a later patch does better.
                 if verdict == "full":
@@ -582,7 +587,9 @@ def repair(
     return results
 
 
-def rescore_patch(patch: Patch, tests: str, posteriors: dict[str, BlockPosterior]) -> Patch:
+def rescore_patch(
+    patch: Patch, tests: str, posteriors: dict[str, BlockPosterior]
+) -> Patch:
     """Re-run PCG inference on the patched source to confirm doubt actually fell."""
     from .pipeline import analyze
 

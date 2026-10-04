@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .blocks import Block, line_to_block
+from .execution import ExecutionConfig, ExecutionResult, run_tests
 
 
 @dataclass
@@ -127,8 +128,7 @@ def _warn_static_degraded(reason: str) -> None:
     emit a warning so the operator knows the sensor is offline.
     """
     warnings.warn(
-        f"[pcg] static analysis degraded: {reason}; "
-        "continuing with AST checks only",
+        f"[pcg] static analysis degraded: {reason}; continuing with AST checks only",
         RuntimeWarning,
         stacklevel=3,
     )
@@ -141,6 +141,7 @@ def collect_static(source: str, blocks: list[Block]) -> list[Evidence]:
 
     # -- pylint ---------------------------------------------------------
     tmp = None
+    pylint_available = False
     try:
         fd, tmp = tempfile.mkstemp(suffix=".py", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -160,7 +161,10 @@ def collect_static(source: str, blocks: list[Block]) -> list[Evidence]:
             timeout=90,
         )
         raw = proc.stdout.strip()
-        msgs = json.loads(raw) if raw.startswith("[") else []
+        if not raw.startswith("["):
+            raise ValueError("pylint did not return JSON diagnostics")
+        msgs = json.loads(raw)
+        pylint_available = True
     except subprocess.TimeoutExpired:
         msgs = []
         _warn_static_degraded("pylint timed out after 90s")
@@ -191,7 +195,7 @@ def collect_static(source: str, blocks: list[Block]) -> list[Evidence]:
                 kind=m.get("symbol", mid),
                 polarity="negative",
                 weight=sev,
-                detail=f"{mid} {m.get('message','')} (line {m.get('line')})",
+                detail=f"{mid} {m.get('message', '')} (line {m.get('line')})",
                 meta={"line": m.get("line")},
             )
         )
@@ -205,7 +209,7 @@ def collect_static(source: str, blocks: list[Block]) -> list[Evidence]:
     # that nothing flagged -- otherwise a block would be simultaneously
     # rewarded for being clean and penalised for its findings.
     for b in blocks:
-        if b.bid not in flagged:
+        if b.bid not in flagged and pylint_available:
             ev.append(
                 Evidence(
                     bid=b.bid,
@@ -214,6 +218,17 @@ def collect_static(source: str, blocks: list[Block]) -> list[Evidence]:
                     polarity="positive",
                     weight=0.22,
                     detail="no static findings",
+                )
+            )
+        elif not pylint_available:
+            ev.append(
+                Evidence(
+                    b.bid,
+                    "static",
+                    "static_unavailable",
+                    "neutral",
+                    0.0,
+                    "pylint unavailable; only targeted AST checks ran",
                 )
             )
     return ev
@@ -248,7 +263,9 @@ def _ast_smells(source: str, blocks: list[Block]) -> list[Evidence]:
         # Comparison to None/True with == instead of is.
         if isinstance(node, ast.Compare):
             for op, cmp in zip(node.ops, node.comparators):
-                if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(cmp, ast.Constant):
+                if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(
+                    cmp, ast.Constant
+                ):
                     if cmp.value is None or isinstance(cmp.value, bool):
                         bid = owner.get(node.lineno)
                         if bid:
@@ -283,144 +300,87 @@ def _ast_smells(source: str, blocks: list[Block]) -> list[Evidence]:
 # --------------------------------------------------------------------------
 # 3. Execution evidence
 # --------------------------------------------------------------------------
+def execution_evidence(result: ExecutionResult, blocks: list[Block]) -> list[Evidence]:
+    """Attach observations only to covered blocks; keep harness errors neutral."""
+    owner = line_to_block(blocks)
+    spectra = {
+        test.nodeid: {owner[line] for line in test.lines if line in owner}
+        for test in result.tests
+        if test.outcome in {"passed", "failed"}
+    }
+    failed = result.failed_ids
+    scores = ochiai_localization(spectra, failed)
+    evidence = []
+    if result.status != "complete" or result.errors:
+        for block in blocks:
+            evidence.append(
+                Evidence(
+                    block.bid,
+                    "exec",
+                    result.status if result.status != "complete" else "harness_error",
+                    "neutral",
+                    0.0,
+                    "; ".join(result.errors) or result.status,
+                    {"execution_status": result.status, "backend": result.backend},
+                )
+            )
+        return evidence
+    # For segmented functions, line ownership names only the segment. Do not
+    # add the umbrella function as a second possible defect on the same lines.
+    for test in result.tests:
+        if test.outcome not in {"passed", "failed"}:
+            continue
+        covered = spectra[test.nodeid]
+        if not covered:
+            continue
+        observation = {
+            "name": test.nodeid,
+            "blocks": sorted(covered),
+            "failed": test.outcome == "failed",
+        }
+        frame_blocks = {owner[ln] for ln in test.frames if ln in owner}
+        for bid in sorted(covered):
+            evidence.append(
+                Evidence(
+                    bid,
+                    "exec",
+                    "test_fail" if observation["failed"] else "test_pass",
+                    "negative" if observation["failed"] else "positive",
+                    1.0,
+                    f"{test.nodeid}: {test.outcome}",
+                    {
+                        "test_observation": observation,
+                        "ochiai": scores.get(bid, 0.0),
+                        "in_traceback": bid in frame_blocks,
+                        "lines": test.lines,
+                        "branches": test.arcs,
+                        "duration": test.duration,
+                    },
+                )
+            )
+    return evidence
+
+
 def collect_exec(
     source: str,
     blocks: list[Block],
     tests: str | None,
     timeout: int = 30,
+    execution: ExecutionConfig | None = None,
 ) -> list[Evidence]:
-    """Execute `tests` against `source` in a subprocess and attribute outcomes.
-
-    Attribution rule: a failing test implicates every block named in its
-    traceback, weighted by how deep in the stack the frame appears (the
-    innermost frame is the most likely culprit). This is a simple spectrum-
-    based fault-localisation prior.
-    """
     if not tests:
         return []
-
-    ev: list[Evidence] = []
-    workdir = tempfile.mkdtemp(prefix="pcg_")
-    mod = os.path.join(workdir, "candidate.py")
-    tst = os.path.join(workdir, "test_candidate.py")
-    try:
-        with open(mod, "w", encoding="utf-8") as fh:
-            fh.write(source)
-        with open(tst, "w", encoding="utf-8") as fh:
-            fh.write(tests)
-
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", tst, "-q", "--tb=long", "--no-header", "-p",
-             "no:cacheprovider"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=workdir,
-        )
-        out = proc.stdout + proc.stderr
-    except subprocess.TimeoutExpired:
-        # A hang means some loop failed to make progress. Blame `while` loops
-        # far more than `for`/comprehensions: iterating a finite collection
-        # terminates by construction, so a non-terminating loop is almost
-        # always a `while` whose guard variable is not advanced.
-        for b in blocks:
-            n_while = _count_while(b.source)
-            if n_while:
-                w = 0.85
-            elif b.n_loops:
-                w = 0.25
-            else:
-                continue
-            ev.append(
-                Evidence(
-                    b.bid, "exec", "timeout", "negative", w,
-                    "test run exceeded time limit; "
-                    + ("contains a while loop" if n_while else "contains a loop"),
-                )
-            )
-        return ev
-    except Exception as e:
-        return [Evidence(b.bid, "exec", "harness_error", "negative", 0.20, str(e))
-                for b in blocks]
-    finally:
-        for p in (mod, tst):
-            try:
-                if os.path.exists(p):
-                    os.unlink(p)
-            except OSError:
-                pass
-        try:
-            os.rmdir(workdir)
-        except OSError:
-            pass
-
-    passed, failed = _parse_pytest_counts(out)
-    implicated = _blame_from_traceback(out, blocks)
-
-    # Spectrum-based refinement: build per-test exposure spectra from the
-    # failure sections and blend Ochiai scores with traceback blame. The two
-    # signals are complementary — tracebacks localise *where it raised*,
-    # spectra capture *which tests co-fail on which code*.
-    spectra: dict[str, set[str]] = {}
-    for tname, sec in _failure_sections_with_names(out):
-        if tname:
-            spectra[tname] = _blocks_in_section(sec, blocks, "candidate")
-    # Failed test names from pytest's short summary line: "FAILED test_x - ...".
-    failed_names: set[str] = set()
-    for line in re.findall(r"^(FAILED .*)$", out, re.MULTILINE):
-        m = re.search(r"(test_\w+)", line)
-        if m:
-            failed_names.add(m.group(1))
-    if spectra and failed_names:
-        och = ochiai_localization(spectra, failed_names)
-        for bid, o in och.items():
-            base = implicated.get(bid, 0.0)
-            # 70/30 blend: traceback is precise but brittle; spectra are
-            # robust but coarse. Neither alone dominates.
-            implicated[bid] = min(1.0, 0.70 * base + 0.30 * o)
-
-    total = passed + failed
-    for b in blocks:
-        share = implicated.get(b.bid, 0.0)
-        if failed and share >= 0.15:
-            # Scale the whole [0.15, 1.0] share range across the weight band so
-            # a peripheral frame (share ~0.3) stays clearly weaker than the
-            # frame that actually raised (share 1.0). Without this, merely
-            # appearing in a traceback nearly maxes out the evidence.
-            norm = (share - 0.15) / 0.85
-            ev.append(
-                Evidence(
-                    b.bid, "exec", "test_fail", "negative",
-                    round(0.25 + 0.70 * norm, 3),
-                    f"implicated in {failed} failing test(s)",
-                    {"share": round(share, 3), "failed": failed},
-                )
-            )
-        elif total and not failed:
-            ev.append(
-                Evidence(
-                    b.bid, "exec", "test_pass", "positive",
-                    min(0.90, 0.45 + 0.08 * passed),
-                    f"{passed}/{total} tests passed",
-                    {"passed": passed},
-                )
-            )
-        elif total and failed and share < 0.15:
-            # Tests ran, some failed, but this block never appeared in a
-            # traceback: mild exoneration.
-            ev.append(
-                Evidence(
-                    b.bid, "exec", "not_implicated", "positive", 0.30,
-                    "executed without appearing in any failure trace",
-                )
-            )
-    return ev
+    return execution_evidence(
+        run_tests(source, tests, execution or ExecutionConfig(timeout=timeout)), blocks
+    )
 
 
 def _count_while(source: str) -> int:
     """Number of `while` statements in a block's source."""
     try:
-        return sum(1 for n in ast.walk(ast.parse(source.strip())) if isinstance(n, ast.While))
+        return sum(
+            1 for n in ast.walk(ast.parse(source.strip())) if isinstance(n, ast.While)
+        )
     except SyntaxError:
         return len(re.findall(r"^\s*while\b", source, re.MULTILINE))
 
@@ -628,11 +588,13 @@ def collect_llm_confidence(
     tokens — into a single confidence score. Mean alone is a poor signal: it is
     dominated by boilerplate tokens and hides localised uncertainty. The
     percentile and low-fraction terms surface exactly those spikes.
-    Otherwise we fall back to a structural proxy: longer, more branch-heavy
-    blocks with more parameters are empirically where LLMs err most.
+    Missing log-probabilities produce no evidence: complexity already informs
+    the prior and must not be counted again as a simulated LLM observation.
     """
     ev: list[Evidence] = []
     for b in blocks:
+        if not token_logprobs or not token_logprobs.get(b.bid):
+            continue
         if token_logprobs and b.bid in token_logprobs and token_logprobs[b.bid]:
             lps = sorted(token_logprobs[b.bid])
             n = len(lps)
@@ -640,9 +602,7 @@ def collect_llm_confidence(
             # 10th-percentile logprob: the weakest ~10% of tokens.
             p10_prob = math.exp(lps[max(0, int(0.10 * n) - 1)])
             frac_low = sum(1 for lp in lps if lp < math.log(0.5)) / n
-            conf = (
-                0.5 * mean_prob + 0.3 * p10_prob + 0.2 * (1.0 - frac_low)
-            )
+            conf = 0.5 * mean_prob + 0.3 * p10_prob + 0.2 * (1.0 - frac_low)
             detail = (
                 f"mean token prob {mean_prob:.3f}, "
                 f"p10 {p10_prob:.3f}, frac_low {frac_low:.2f}"
@@ -654,18 +614,6 @@ def collect_llm_confidence(
                 "p10_prob": round(p10_prob, 4),
                 "frac_low": round(frac_low, 4),
             }
-        else:
-            # Proxy in (0,1): decays with complexity.
-            penalty = (
-                0.045 * b.cyclomatic
-                + 0.012 * b.loc
-                + 0.03 * b.depth
-                + 0.02 * b.n_params
-            )
-            conf = 1.0 / (1.0 + penalty)
-            detail = f"structural proxy (cc={b.cyclomatic}, loc={b.loc}, depth={b.depth})"
-            kind = "confidence_proxy"
-            stats_meta = {"confidence": round(conf, 4)}
 
         conf = min(max(conf, 0.02), 0.98)
         ev.append(
@@ -759,14 +707,21 @@ def collect_all(
     token_logprobs: dict[str, list[float]] | None = None,
     critic: Any = None,
     critic_backend: str | None = None,
+    execution: ExecutionConfig | None = None,
+    execution_result: ExecutionResult | None = None,
 ) -> list[Evidence]:
     ev = collect_compile(source, blocks)
     fatal = any(e.kind == "syntax_error" for e in ev)
     ev += collect_llm_confidence(blocks, token_logprobs)
     if critic or critic_backend:
-        ev += collect_llm_critic(source, blocks, critic=critic, critic_backend=critic_backend)
+        ev += collect_llm_critic(
+            source, blocks, critic=critic, critic_backend=critic_backend
+        )
     if not fatal:
         ev += collect_static(source, blocks)
-        ev += collect_exec(source, blocks, tests)
+        ev += (
+            execution_evidence(execution_result, blocks)
+            if execution_result is not None
+            else collect_exec(source, blocks, tests, execution=execution)
+        )
     return ev
-

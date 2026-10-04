@@ -12,6 +12,7 @@ Two backends:
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import time
@@ -39,13 +40,20 @@ def _parse_response(text: str) -> dict[str, Any]:
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     try:
         obj = json.loads(text)
+        if (
+            type(obj["is_buggy"]) is not bool
+            or type(obj["confidence"]) not in {float, int}
+            or not math.isfinite(obj["confidence"])
+            or not 0 <= obj["confidence"] <= 1
+        ):
+            raise ValueError("critic verdict must contain a Boolean and a probability")
         return {
-            "is_buggy": bool(obj["is_buggy"]),
+            "is_buggy": obj["is_buggy"],
             "confidence": float(obj["confidence"]),
             "reason": str(obj.get("reason", "")),
             "raw": text,
         }
-    except (json.JSONDecodeError, KeyError, ValueError):
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
         return {
             "is_buggy": None,
             "confidence": None,

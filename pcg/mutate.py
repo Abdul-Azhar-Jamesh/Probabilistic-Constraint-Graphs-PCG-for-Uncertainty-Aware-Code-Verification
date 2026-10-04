@@ -12,22 +12,18 @@ LLMs actually produce: off-by-one boundaries, flipped comparisons, wrong
 initialisers, dropped guards, and swapped operands.
 
 A mutant is only kept if it is *detectable* -- it must still parse, and it must
-actually change behaviour on the reference test suite. A mutant that passes all
-tests is "equivalent" and is discarded, since no evidence source could
-distinguish it and it would be an unfair negative.
+actually change behaviour on the reference test suite. A surviving mutant is undetected by the supplied tests; equivalence is unknown.
+The training corpus retains detected mutants, while test_quality reports survivors.
 """
 
 from __future__ import annotations
 
 import ast
-import os
 import random
 import re
-import shutil
-import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass, field
+
+from .execution import ExecutionConfig, run_tests
 
 
 @dataclass
@@ -167,9 +163,7 @@ OPERATORS = ["boundary", "arithmetic", "offbyone", "dropguard", "swapargs"]
 FAULT_OPERATORS = ["syntax", "undefined_name", "wrong_arg_count", "import_error"]
 
 
-def generate_fault_mutants(
-    program: str, source: str, tests: str
-) -> list[Mutant]:
+def generate_fault_mutants(program: str, source: str, tests: str) -> list[Mutant]:
     """Generate compile and runtime faults absent from AST-preserving mutants."""
     match = re.search(r"^(def|async def)\s+(\w+)\s*\([^\n]*\):", source, re.MULTILINE)
     if not match:
@@ -183,22 +177,37 @@ def generate_fault_mutants(
     }
     mutants: list[Mutant] = []
     for operator, statement in insertion.items():
-        mutants.append(Mutant(
-            case_id=f"{program}:{operator}:0", program=program,
-            operator=operator, source=source[:line_end] + statement + source[line_end:],
-            tests=tests, buggy_block=function, description=operator.replace("_", " "),
-            lineno=source[:line_end].count("\n") + 1,
-        ))
+        mutants.append(
+            Mutant(
+                case_id=f"{program}:{operator}:0",
+                program=program,
+                operator=operator,
+                source=source[:line_end] + statement + source[line_end:],
+                tests=tests,
+                buggy_block=function,
+                description=operator.replace("_", " "),
+                lineno=source[:line_end].count("\n") + 1,
+            )
+        )
     syntax_source = re.sub(
         rf"^(def|async def)\s+{re.escape(function)}\s*\([^\n]*\):",
-        rf"\1 {function}(:", source, count=1, flags=re.MULTILINE,
+        rf"\1 {function}(:",
+        source,
+        count=1,
+        flags=re.MULTILINE,
     )
-    mutants.append(Mutant(
-        case_id=f"{program}:syntax:0", program=program, operator="syntax",
-        source=syntax_source, tests=tests, buggy_block=function,
-        description="malformed function signature",
-        lineno=source[:line_end].count("\n") + 1,
-    ))
+    mutants.append(
+        Mutant(
+            case_id=f"{program}:syntax:0",
+            program=program,
+            operator="syntax",
+            source=syntax_source,
+            tests=tests,
+            buggy_block=function,
+            description="malformed function signature",
+            lineno=source[:line_end].count("\n") + 1,
+        )
+    )
     return mutants
 
 
@@ -258,32 +267,17 @@ def generate_mutants(
 # Viability filtering
 # --------------------------------------------------------------------------
 def is_detectable(source: str, tests: str, timeout: int = 25) -> bool:
-    """Does this mutant actually fail the reference suite?
+    """An observed compile failure or failed assertion detects a mutation.
 
-    Mutants that still pass every test are *equivalent mutants*: no evidence
-    source could possibly detect them, so scoring the framework against them
-    would measure nothing. Standard practice is to exclude them.
+    Surviving mutants are undetected, not necessarily semantically equivalent.
+    Harness errors and absent dependencies are not valid defect labels.
     """
-    wd = tempfile.mkdtemp(prefix="mut_")
     try:
-        with open(os.path.join(wd, "candidate.py"), "w", encoding="utf-8") as fh:
-            fh.write(source)
-        with open(os.path.join(wd, "test_candidate.py"), "w", encoding="utf-8") as fh:
-            fh.write(tests)
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "test_candidate.py", "-q",
-             "--no-header", "-p", "no:cacheprovider"],
-            capture_output=True, text=True, cwd=wd, timeout=timeout,
-        )
-        # Non-zero exit == at least one failure == detectable.
-        return proc.returncode != 0
-    except subprocess.TimeoutExpired:
-        return True  # a hang is very much a detectable defect
-    except Exception:
-        return False
-    finally:
-        # pytest leaves __pycache__ behind, so rmdir is not enough.
-        shutil.rmtree(wd, ignore_errors=True)
+        compile(source, "candidate.py", "exec")
+    except (SyntaxError, ValueError):
+        return True
+    result = run_tests(source, tests, ExecutionConfig(timeout=timeout))
+    return result.valid and bool(result.failed_ids)
 
 
 def build_corpus(
@@ -319,7 +313,7 @@ def build_corpus(
     if verbose:
         print(
             f"\n  corpus: {len(kept)} detectable mutants "
-            f"({n_generated - len(kept)} equivalent mutants discarded)"
+            f"({n_generated - len(kept)} undetected mutants discarded; equivalence unknown)"
         )
     return kept
 

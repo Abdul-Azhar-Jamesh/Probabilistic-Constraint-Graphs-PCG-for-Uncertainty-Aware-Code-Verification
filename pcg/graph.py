@@ -32,29 +32,39 @@ EDGE_STRENGTH = {
 LEARNED_EDGE_STRENGTH = dict(EDGE_STRENGTH)
 
 
-def build_graph(blocks: list[Block]) -> nx.DiGraph[str]:
+def build_graph(
+    blocks: list[Block], strengths: dict[str, float] | None = None
+) -> nx.DiGraph[str]:
     """Build the constraint graph.
 
     Edge direction convention: an edge ``B -> A`` means "B supports A", i.e.
     evidence flows from the depended-upon block toward its dependents. This
-    orientation makes the graph a Bayesian network where each node's parents
-    are the things it relies on.
+    This is a code dependency graph, possibly cyclic. The separate latent-
+    defect Bayesian model conditions on test outcomes and queries this graph.
     """
     # Nodes are block ids, so the graph is keyed by str.
     g: nx.DiGraph[str] = nx.DiGraph()
+    edge_strengths = strengths or LEARNED_EDGE_STRENGTH
     by_name: dict[str, str] = {}
+    qualified_ids = {b.qualname: b.bid for b in blocks}
     for b in blocks:
         g.add_node(b.bid, block=b)
-        for d in b.defines:
-            by_name[d] = b.bid
-        # Methods are also reachable by bare name from call sites.
-        if b.kind == "method":
-            by_name.setdefault(b.name, b.bid)
+        if b.kind != "method":
+            for d in b.defines:
+                by_name[d] = b.bid
+
+    def resolve(name: str, block: Block) -> str | None:
+        if name.startswith(("self.", "cls.")) and "." in block.qualname:
+            parent = block.qualname.split("#seg", 1)[0].rsplit(".", 1)[0]
+            return qualified_ids.get(parent + "." + name.split(".", 1)[1])
+        if "." in name:
+            return qualified_ids.get(name)
+        return by_name.get(name)
 
     for b in blocks:
         seen: set[tuple[str, str]] = set()
         for callee in b.calls:
-            tgt = by_name.get(callee)
+            tgt = resolve(callee, b)
             if tgt and tgt != b.bid and (tgt, "calls") not in seen:
                 seen.add((tgt, "calls"))
                 g.add_edge(
@@ -62,7 +72,7 @@ def build_graph(blocks: list[Block]) -> nx.DiGraph[str]:
                     b.bid,
                     kind="calls",
                     detail=f"{b.qualname} calls {callee}",
-                    strength=LEARNED_EDGE_STRENGTH["calls"],
+                    strength=edge_strengths["calls"],
                 )
         for name in b.reads:
             tgt = by_name.get(name)
@@ -78,7 +88,7 @@ def build_graph(blocks: list[Block]) -> nx.DiGraph[str]:
                     b.bid,
                     kind="dataflow",
                     detail=f"{b.qualname} reads {name}",
-                    strength=LEARNED_EDGE_STRENGTH["dataflow"],
+                    strength=edge_strengths["dataflow"],
                 )
 
     # Segment containment: a function depends on each of its segments, so a
@@ -96,7 +106,7 @@ def build_graph(blocks: list[Block]) -> nx.DiGraph[str]:
                 parent.bid,
                 kind="calls",
                 detail=f"{parent.qualname} contains {seg.qualname}",
-                strength=LEARNED_EDGE_STRENGTH["calls"],
+                strength=edge_strengths["calls"],
             )
     return g
 
@@ -120,7 +130,7 @@ def structural_importance(g: nx.DiGraph, blocks: list[Block]) -> dict[str, float
             reach[bid] = 0.0
 
     try:
-        pr = nx.pagerank(g, alpha=0.85) if g.number_of_edges() else {}
+        pr = nx.pagerank(g.reverse(), alpha=0.85) if g.number_of_edges() else {}
     except Exception:
         pr = {}
     if pr:

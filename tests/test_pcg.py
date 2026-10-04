@@ -19,14 +19,14 @@ from pcg.inference import (
 )
 from pcg.pipeline import analyze
 
-SIMPLE = '''
+SIMPLE = """
 def helper(x):
     return x * 2
 
 
 def caller(y):
     return helper(y) + 1
-'''
+"""
 
 
 class TestBlocks:
@@ -72,7 +72,7 @@ class TestBlocks:
             extract_blocks("def f(:\n    pass\n")
 
 
-BIG_FUNCTION = '''
+BIG_FUNCTION = """
 def big(xs):
     total = 0
     for x in xs:
@@ -114,7 +114,7 @@ def big(xs):
         "ranks": ranks,
     }
     return summary
-'''
+"""
 
 
 class TestSegments:
@@ -229,9 +229,7 @@ class TestInference:
         blocks = extract_blocks(SIMPLE)
         g = build_graph(blocks)
         ids = {b.qualname: b.bid for b in blocks}
-        ev = [
-            Evidence(ids["helper"], "exec", "test_fail", "negative", 0.95, "broken")
-        ]
+        ev = [Evidence(ids["helper"], "exec", "test_fail", "negative", 0.95, "broken")]
         post = infer(blocks, g, ev)
         assert post[ids["caller"]].posterior < post[ids["caller"]].local
 
@@ -241,9 +239,7 @@ class TestInference:
         blocks = extract_blocks(SIMPLE)
         g = build_graph(blocks)
         ids = {b.qualname: b.bid for b in blocks}
-        ev = [
-            Evidence(ids["helper"], "exec", "test_fail", "negative", 0.95, "broken")
-        ]
+        ev = [Evidence(ids["helper"], "exec", "test_fail", "negative", 0.95, "broken")]
         post = infer(blocks, g, ev, structural_importance(g, blocks))
         assert post[ids["helper"]].culpability > post[ids["caller"]].culpability
         assert post[ids["caller"]].inherited > post[ids["helper"]].inherited
@@ -255,9 +251,7 @@ class TestInference:
         blocks = extract_blocks(SIMPLE)
         g = build_graph(blocks)
         ids = {b.qualname: b.bid for b in blocks}
-        ev = [
-            Evidence(ids["helper"], "exec", "test_fail", "negative", 0.95, "broken")
-        ]
+        ev = [Evidence(ids["helper"], "exec", "test_fail", "negative", 0.95, "broken")]
         post = infer(blocks, g, ev)
         repairs = repair_targets(post, 0.5)
         for bid in repairs:
@@ -266,7 +260,6 @@ class TestInference:
         roots = find_root_repairs(post, g, 0.5)
         assert ids["helper"] in roots
         assert ids["caller"] not in roots
-
 
 
 class TestEvidenceParsing:
@@ -339,7 +332,10 @@ class TestCalibration:
 
         mutants = generate_fault_mutants("demo", SIMPLE, "")
         assert {m.operator for m in mutants} == {
-            "syntax", "undefined_name", "wrong_arg_count", "import_error"
+            "syntax",
+            "undefined_name",
+            "wrong_arg_count",
+            "import_error",
         }
 
     def test_training_labels_keep_downstream_separate_from_bug_label(self):
@@ -386,7 +382,9 @@ class TestCalibration:
         assert any(hasattr(f, "exec_critic_interaction") for f in features)
         assert any(hasattr(f, "llm_critic_interaction") for f in features)
 
-    def test_threshold_selection_loads_saved_validation_threshold(self, tmp_path, monkeypatch):
+    def test_threshold_selection_loads_saved_validation_threshold(
+        self, tmp_path, monkeypatch
+    ):
         from pcg import inference
 
         payload = {"selected_threshold": 0.63, "metric": "f1"}
@@ -398,9 +396,18 @@ class TestCalibration:
     def test_abstention_band_uses_validation_margin(self):
         from pcg.inference import classify_abstention
 
-        assert classify_abstention(0.20, threshold=0.63, calibration_ece=0.08) == "LIKELY_DEFECTIVE"
-        assert classify_abstention(0.70, threshold=0.63, calibration_ece=0.08) == "UNCERTAIN"
-        assert classify_abstention(0.90, threshold=0.63, calibration_ece=0.08) == "LIKELY_CORRECT"
+        assert (
+            classify_abstention(0.20, threshold=0.63, calibration_ece=0.08)
+            == "LIKELY_DEFECTIVE"
+        )
+        assert (
+            classify_abstention(0.70, threshold=0.63, calibration_ece=0.08)
+            == "UNCERTAIN"
+        )
+        assert (
+            classify_abstention(0.90, threshold=0.63, calibration_ece=0.08)
+            == "LIKELY_CORRECT"
+        )
 
     def test_root_defect_metrics_compute_from_ground_truth(self):
         from pcg.build_training_set import root_defect_metrics
@@ -434,8 +441,7 @@ class TestEndToEnd:
     def test_clean_code_stays_confident(self):
         src = "def add(a, b):\n    return a + b\n"
         tests = (
-            "from candidate import add\n\n"
-            "def test_add():\n    assert add(1, 2) == 3\n"
+            "from candidate import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
         )
         a = analyze(src, tests)
         ids = {b.qualname: b.bid for b in a.blocks}
@@ -530,4 +536,3 @@ class TestCritic:
         critic_ev = [e for e in a.evidence if e.source == "critic"]
         assert len(critic_ev) > 0
         assert len(a.posteriors) == len(a.blocks)
-

@@ -37,18 +37,22 @@ from .inference import (
 
 
 def _sensor_likelihood_ratios(
-    features: list[BlockFeatures], smoothing: float = 1.0,
+    features: list[BlockFeatures],
+    smoothing: float = 1.0,
     compile_floor: float = 1.5,
 ) -> dict[str, float]:
     """Estimate defect signal as a smoothed class-conditional likelihood ratio."""
     ratios: dict[str, float] = {}
     for source in ("compile", "static", "exec", "llm", "critic"):
         present = [
-            getattr(feature, f"{source}_neg_weight_sum") > 0
-            for feature in features
+            getattr(feature, f"{source}_neg_weight_sum") > 0 for feature in features
         ]
-        correct = [value for value, feature in zip(present, features) if feature.label == 1]
-        defective = [value for value, feature in zip(present, features) if feature.label == 0]
+        correct = [
+            value for value, feature in zip(present, features) if feature.label == 1
+        ]
+        defective = [
+            value for value, feature in zip(present, features) if feature.label == 0
+        ]
         p_correct = (sum(correct) + smoothing) / (len(correct) + 2 * smoothing)
         p_defective = (sum(defective) + smoothing) / (len(defective) + 2 * smoothing)
         ratios[source] = max(0.0, float(np.log(p_defective / p_correct)))
@@ -61,10 +65,10 @@ def _features_to_arrays(
     feature_names: list[str],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract (X, y) arrays from feature list."""
-    X = np.array([
-        [getattr(f, name) for name in feature_names]
-        for f in features
-    ], dtype=np.float64)
+    X = np.array(
+        [[getattr(f, name) for name in feature_names] for f in features],
+        dtype=np.float64,
+    )
     y = np.array([f.label for f in features], dtype=np.int32)
     return X, y
 
@@ -77,14 +81,20 @@ def _grouped_cv_predict(
     from sklearn.model_selection import GroupKFold, cross_val_predict
 
     X, y = _features_to_arrays(features, feature_names)
-    groups = np.array([":".join(f.case_id.split(":")[:2]) for f in features])
+    from .validation import program_group
+
+    groups = np.array([program_group(f.case_id) for f in features])
     n_splits = min(5, len(set(groups)))
     if n_splits < 2:
-        return LogisticRegression(penalty="l2", C=C, max_iter=1000).fit(X, y).predict_proba(X)[:, 1]
+        raise ValueError("cross-validation requires at least two independent programs")
     cv = GroupKFold(n_splits=n_splits)
     return cross_val_predict(
         LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs"),
-        X, y, cv=cv, groups=groups, method="predict_proba",
+        X,
+        y,
+        cv=cv,
+        groups=groups,
+        method="predict_proba",
     )[:, 1]
 
 
@@ -96,6 +106,7 @@ def fit_prior(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any]:
     the hand-set 0.22, 0.030, 0.10, 0.05 in prior_correctness().
     """
     from sklearn.linear_model import LogisticRegression
+
     X, y = _features_to_arrays(features, STRUCTURAL_FEATURE_NAMES)
 
     clf = LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs")
@@ -136,6 +147,7 @@ def fit_evidence(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any
     The fitted coefficients on *_neg_weight_sum map to SOURCE_RELIABILITY.
     """
     from sklearn.linear_model import LogisticRegression
+
     X, y = _features_to_arrays(features, EVIDENCE_FEATURE_NAMES)
 
     clf = LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs")
@@ -182,6 +194,7 @@ def fit_evidence(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any
 def fit_joint(features: list[BlockFeatures], C: float = 1.0) -> dict[str, Any]:
     """Fit a joint model on all features for comparison."""
     from sklearn.linear_model import LogisticRegression
+
     X, y = _features_to_arrays(features, ALL_FEATURE_NAMES)
 
     clf = LogisticRegression(penalty="l2", C=C, max_iter=1000, solver="lbfgs")
@@ -220,9 +233,7 @@ def _f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 2 * p * r / (p + r) if (p + r) else 0.0
 
 
-def extract_fitted_weights(
-    prior_result: dict, evidence_result: dict
-) -> dict[str, Any]:
+def extract_fitted_weights(prior_result: dict, evidence_result: dict) -> dict[str, Any]:
     """Extract weights for injection into inference.py."""
     # Prior coefficients: map LR coefs to prior_correctness() format.
     # prior_correctness uses:  penalty = c0*log1p(cc-1) + c1*log1p(loc) + c2*depth + c3*n_params
@@ -262,13 +273,13 @@ def compare_holdout(
 ) -> dict[str, Any]:
     """Run the holdout case with hand-tuned vs. fitted weights.
 
-    Temporarily patches inference.py constants, runs the evaluation,
-    then restores the originals.
+    Legacy coefficients are converted explicitly; no global state is modified.
+    Use pcg.validation for repository-disjoint runtime evaluation.
     """
-    from . import inference
+    from .sensors import SensorModel
 
     # Load the holdout case
-    holdout_src = '''
+    holdout_src = """
 def parse_kv(line):
     k, v = line.split("=")
     return k.strip(), v.strip()
@@ -292,8 +303,8 @@ def merge(a, b):
     out = a
     out.update(b)
     return out
-'''
-    holdout_tests = '''
+"""
+    holdout_tests = """
 from candidate import parse_kv, build_config, get_int, merge
 
 def test_parse():
@@ -312,40 +323,27 @@ def test_merge_no_mutation():
     a = {"x": 1}
     merge(a, {"y": 2})
     assert a == {"x": 1}
-'''
+"""
     holdout_case = Case(
-        "config", holdout_src, holdout_tests,
+        "config",
+        holdout_src,
+        holdout_tests,
         buggy={"parse_kv", "merge"},
         unreliable={"parse_kv", "merge", "build_config"},
     )
 
-    # -- Run with hand-tuned weights ---
-    # Ensure hand-tuned values are active
-    old_rel = dict(inference.SOURCE_RELIABILITY)
-    old_prior = dict(inference._PRIOR_COEFFICIENTS)
-
-    inference.SOURCE_RELIABILITY.update(
-        inference.SOURCE_RELIABILITY_HANDTUNED
-    )
-    inference._PRIOR_COEFFICIENTS.update(
-        inference.PRIOR_COEFFICIENTS_HANDTUNED
-    )
-
     res_handtuned = evaluate([holdout_case])
-
-    # -- Run with fitted weights ---
-    inference.SOURCE_RELIABILITY.update(
-        fitted_weights["source_reliability_fitted"]
+    legacy = fitted_weights["prior_coefficients_fitted"]
+    coefficients = {
+        name: -value for name, value in legacy.items() if name != "intercept"
+    }
+    coefficients["intercept"] = legacy.get("intercept", 0.0)
+    model = SensorModel(prior_coefficients=coefficients)
+    res_fitted = evaluate(
+        [holdout_case],
+        model=model,
+        reliabilities=fitted_weights["source_reliability_fitted"],
     )
-    inference._PRIOR_COEFFICIENTS.update(
-        fitted_weights["prior_coefficients_fitted"]
-    )
-
-    res_fitted = evaluate([holdout_case])
-
-    # Restore originals
-    inference.SOURCE_RELIABILITY.update(old_rel)
-    inference._PRIOR_COEFFICIENTS.update(old_prior)
 
     return {
         "handtuned": {
@@ -401,7 +399,9 @@ def main() -> None:
     print(f"  CV F1:       {evidence_result['cv_f1']:.4f}")
     print(f"  CV ECE:      {evidence_result['cv_ece']:.4f}")
     print(f"  CV Brier:    {evidence_result['cv_brier']:.4f}")
-    print(f"  SOURCE_RELIABILITY (fitted): {evidence_result['source_reliability_fitted']}")
+    print(
+        f"  SOURCE_RELIABILITY (fitted): {evidence_result['source_reliability_fitted']}"
+    )
 
     # -- Step 4: Fit joint model -------------------------------------------
     print("\n[3b/5] Fitting joint model (all features, for comparison)...")
@@ -414,10 +414,13 @@ def main() -> None:
     # -- Step 5: Extract and save fitted weights ---------------------------
     print("\n[4/5] Extracting fitted weights...")
     fitted_weights = extract_fitted_weights(prior_result, evidence_result)
-    save_fitted_weights(fitted_weights)
+    # Legacy logistic feature diagnostics are not the deployed graph model.
+    # Keep their output separate and never overwrite active runtime settings.
+    save_fitted_weights(fitted_weights, out_dir="out/legacy_feature_models")
     save_selected_thresholds(
         evidence_result["validation_posterior_threshold"],
         evidence_result["validation_culpability_threshold"],
+        out_dir="out/legacy_feature_models",
     )
     print(
         "  Validation thresholds: "
@@ -428,7 +431,7 @@ def main() -> None:
     # Print comparison table of old vs new weights
     print("\n  SOURCE_RELIABILITY comparison:")
     print(f"  {'Source':<10} {'Hand-tuned':>12} {'Fitted':>12}")
-    print(f"  {'-'*10} {'-'*12} {'-'*12}")
+    print(f"  {'-' * 10} {'-' * 12} {'-' * 12}")
     for src in ("compile", "static", "exec", "llm"):
         old = fitted_weights["source_reliability_handtuned"][src]
         new = fitted_weights["source_reliability_fitted"][src]
@@ -436,7 +439,7 @@ def main() -> None:
 
     print("\n  Prior coefficients comparison:")
     print(f"  {'Feature':<18} {'Hand-tuned':>12} {'Fitted':>12}")
-    print(f"  {'-'*18} {'-'*12} {'-'*12}")
+    print(f"  {'-' * 18} {'-' * 12} {'-' * 12}")
     for feat in ("log_cyclomatic", "log_loc", "depth", "n_params"):
         old = fitted_weights["prior_coefficients_handtuned"][feat]
         new = fitted_weights["prior_coefficients_fitted"][feat]
@@ -448,9 +451,15 @@ def main() -> None:
 
     print("\n  Holdout comparison (before vs. after calibration):")
     print(f"  {'Metric':<16} {'Hand-tuned':>12} {'Fitted':>12} {'Delta':>10}")
-    print(f"  {'─'*16} {'─'*12} {'─'*12} {'─'*10}")
-    for metric in ("trust_f1", "trust_ece", "trust_brier",
-                    "blame_f1", "blame_ece", "blame_brier"):
+    print(f"  {'─' * 16} {'─' * 12} {'─' * 12} {'─' * 10}")
+    for metric in (
+        "trust_f1",
+        "trust_ece",
+        "trust_brier",
+        "blame_f1",
+        "blame_ece",
+        "blame_brier",
+    ):
         old = comparison["handtuned"][metric]
         new = comparison["fitted"][metric]
         delta = new - old
@@ -469,7 +478,9 @@ def main() -> None:
         "fitted_weights": fitted_weights,
         "holdout_comparison": comparison,
     }
-    results_path = os.path.join("out", "calibration_results.json")
+    results_path = os.path.join(
+        "out", "legacy_feature_models", "calibration_results.json"
+    )
     with open(results_path, "w", encoding="utf-8") as fh:
         json.dump(results, fh, indent=2)
     print(f"\nFull results saved: {results_path}")

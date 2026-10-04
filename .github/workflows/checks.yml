@@ -1,0 +1,29 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev,app]"
+      - run: python -m ruff check pcg tests scripts deploy app.py
+      - run: python -m pytest -q
+  docker-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e ".[dev]"
+      - run: docker build -f deploy/Dockerfile.worker -t pcg-worker:latest deploy
+      - run: python -m pytest -q tests/test_execution.py
+        env:
+          PCG_TEST_DOCKER: '1'

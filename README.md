@@ -1,206 +1,65 @@
-# Probabilistic Constraint Graphs (PCG) for Uncertainty-Aware Code Verification
+# Probabilistic Constraint Graphs
 
-PCG is a Bayesian framework designed to assess the correctness of LLM-generated code by fusing heterogeneous evidence sources (compiler diagnostics, static analysis, test executions, and LLM confidences) over a structured constraint graph of code blocks.
+PCG is a Python code-review research tool for **22AIE301 Probabilistic Reasoning**. It combines a code dependency graph with a latent-defect Bayesian model, coverage-backed test evidence, and separate estimates of intrinsic defects and downstream output trust.
 
-Rather than treating code correctness as a binary, program-wide property (e.g., "does it pass all tests?"), PCG isolates errors at the granularity of individual functions/methods and outputs a **Correctness Probability Map**. This allows developers and automated repair systems to distinguish between code that is **inherently buggy** and code that is merely **unreliable due to upstream dependencies**.
+Scores concern specified behavior and available evidence. They are not proofs of correctness. Default observation probabilities are documented assumptions; fitted models require independent evaluation before deployment claims.
 
----
+## Install and run
 
-## ── Pipeline Architecture ──
-
-The verification pipeline processes source code and test suites through five distinct stages:
-
-```
-Source Code ──> AST Decomposition ──> Constraint Graph Construction
-                                            │
-        ┌──── Compiler Diagnostics ─────────┤
-        ├──── Static Analysis (Pylint+AST) ─┤
-        ├──── Execution (Pytest Outcomes) ──┼──> Bayesian Fusion (Log-Odds)
-        └──── LLM Confidence (Logprobs) ────┘            │
-                                                         ▼
-                                       Noisy-AND Constraint Propagation
-                                                         │
-                                                         ▼
-                                     Correctness Probability Map & Repair Set
-```
-
-### 1. AST Block Decomposition (`blocks.py`)
-Programs are decomposed into hierarchical **blocks** (functions, methods, and module-level statement groups). Decomposing code at this level aligns with how:
-- **Evidence** is reported (e.g., a traceback points to a specific function execution).
-- **Repair** is implemented (e.g., regenerating or rewriting a single function instead of the entire file).
-
-### 2. Constraint Graph Construction (`graph.py`)
-Edges in the graph represent dependency constraints between blocks. An edge from `B -> A` (or `A` depends on `B`) means that if `B` is buggy, the correctness of `A` is compromised.
-Edges carry weights indicating **coupling strengths**:
-- `calls` (strength: `0.85`): Direct invocation of helper functions.
-- `dataflow` (strength: `0.70`): Passing of variables/objects.
-- `sequence` (strength: `0.25`): Temporal or execution order dependencies.
-
-Cycles caused by mutual recursion are resolved by **condensation** (collapsing the cycle into a single representative node to prevent infinite propagation loops).
-
-### 3. Evidence Collection (`evidence.py`)
-The pipeline gathers evidence from five distinct sensors:
-- **Compile Diagnostics**: Syntax errors, import issues, and compilation warnings.
-- **Static Analysis**: Linting errors/warnings (Pylint rules) and AST smells (e.g., deeply nested loops, empty exception handlers).
-- **Execution Outcomes**: Test suite results and parsed tracebacks that localize failure points to specific call-stack frames.
-- **LLM Confidence**: Token logprobs or structural code properties acting as a proxy for the generator's confidence.
-- **LLM Code Review Critic (`critic.py`)**: Direct semantic assessment of code blocks by an LLM reviewer (Claude API or mock heuristic), returning structured bug verdicts with confidence and reasoning.
-
-### 4. Bayesian Fusion & Constraint Propagation (`inference.py`)
-1. **Prior Estimation**: Structural features (complexity, length, depth, parameter counts) determine a block's prior probability of being correct.
-2. **Local Fusion**: Evidence associated with a block is fused using a Naive Bayes model in log-odds space to calculate its local correctness probability.
-3. **Noisy-AND Propagation**: The local probabilities are propagated along the constraint graph to a fixed point. The trust in block $i$, denoted by $P(C_i)$, depends on its local trust $P_{\text{local}}(i)$ and the trustworthiness of all its dependencies:
-   $$P(C_i) \leftarrow P_{\text{local}}(i) \cdot \prod_{j \in \text{deps}(i)} [ 1 - s_{ij} \cdot (1 - P(C_j)) ]$$
-   where $s_{ij}$ is the coupling strength of the dependency edge from $j$ to $i$.
-
----
-
-## ── Key Design Concept: Posterior vs. Culpability ──
-
-A naive belief-propagation model creates a "propagation trap." If function `median` is buggy, any function calling it (e.g., `summarize`) will also produce incorrect results. The posterior probability $P(C_{\text{summarize}})$ correctly collapses to near $0.0$. 
-
-However, flagging `summarize` for repair is a **false positive**—its own implementation is correct; it is simply suffering from **inherited doubt**. 
-
-To solve this, PCG reports two separate metrics per block:
-
-1. **`posterior`** ($P(\text{correct} \mid \text{Evidence})$): *"Can I trust this block's output?"* This includes inherited doubt and is used to decide whether to **abstain** from using the code.
-2. **`culpability`** ($1 - P_{\text{local}}$): *"Is this block's own implementation defective?"* This isolates evidence originating strictly within the block and is used to identify **repair targets**.
-
-Automated repair systems target blocks with high **culpability**, while users review the final Correctness Map using both metrics.
-
----
-
-## ── Training & Calibration Engine ──
-
-To move away from hand-tuned constants (reliability coefficients, edge strengths, prior coefficients), PCG features an end-to-end calibration engine.
-
-### 1. Mutation Generation (`mutate.py`)
-Correct reference programs (located in the `REFERENCE_PROGRAMS` dictionary in `pcg/corpus.py`) are mutated to synthesize labeled bugs. The mutation operators mirror common LLM bugs:
-- **`boundary`**: Flips comparison operators (e.g., `<` to `<=`).
-- **`arithmetic`**: Swaps basic operators (e.g., `+` to `-`).
-- **`offbyone`**: Adjusts integer constants (e.g., `+1` or `-1`).
-- **`dropguard`**: Removes early-return guard clauses.
-- **`swapargs`**: Swaps the arguments of non-commutative function calls.
-- **`syntax`**, **`undefined_name`**, **`wrong_arg_count`**, and **`import_error`**:
-  add compile-time and runtime faults with known labels.
-
-Mutants are ran against the reference test suite. Equivalent mutants (those that still pass all tests) are discarded, ensuring all corpus mutants are **detectable**.
-
-### 2. Feature Extraction (`build_training_set.py`)
-Features are extracted for each block across all mutants, compiling both:
-- **Structural Features**: `log_cyclomatic`, `log_loc`, `depth`, `n_params`
-- **Evidence Features**: Counts and weight sums of compile, static, execution, and LLM evidence.
-
-### 3. Model Calibration (`fit_weights.py` / `calibrate.py`)
-Sensor strengths are estimated from smoothed class-conditional likelihood ratios
-``log(P(E | correct) / P(E | defective))``; compiler evidence has a minimum
-reliability floor. Logistic regression remains available for comparison and
-prior fitting. Validation predictions use grouped splits by reference program
-and mutation family, and posterior and culpability thresholds are selected
-separately on validation data before held-out reporting:
-1. **Prior Model**: Predicts correctness prior using structural features.
-2. **Evidence Model**: Reports sensor likelihood-ratio strengths.
-3. **Thresholds**: Selects independent posterior and culpability cutoffs.
-
-The mock critic remains a development substitute rather than validation of a
-real LLM reviewer; it is kept at zero or near-zero weight until evaluated on
-real labeled bugs.
-
----
-
-## ── Getting Started ──
-
-### Installation
-Ensure you have the required dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-To install the optional dashboard, real Claude critic, and calibration tools
-from the package metadata:
-```bash
-pip install -e ".[app,critic,calibration]"
-```
-
-### Regenerating the Corpus Cache
-`out/corpus_mutants.pkl` is a shared cache consumed by **both** `python -m pcg.evaluate` and `python scripts/run_calibration.py`. If you add or remove reference programs in `pcg/corpus.py`, delete this file before running either command so the new programs are picked up:
-```bash
-rm out/corpus_mutants.pkl   # Windows: del out\corpus_mutants.pkl
-```
-You can also control runtime during iteration by capping the corpus size. Pass `max_mutants=40` to `load_mutant_corpus()` (in `mutate.py`) to use roughly the first 40 detectable mutants instead of the full set.
-
-### Running the Analysis Pipeline
-Analyze a target candidate file against its test suite (optionally evaluating each block with an LLM reviewer):
-```bash
-# Basic run with compiler, static analysis, and test execution evidence:
-python -m pcg.pipeline demo/candidate.py -t demo/test_candidate.py --json out/report.json --html out/report.html --heatmap
-
-# Enable the LLM Code Review Critic (mock heuristic or Anthropic Claude API):
-python -m pcg.pipeline demo/candidate.py -t demo/test_candidate.py --critic mock
-python -m pcg.pipeline demo/candidate.py -t demo/test_candidate.py --critic anthropic
-```
-This produces:
-- A console summary highlighting **Repair Targets** (high culpability) vs. **Downstream Unreliable Blocks** (low culpability but low posterior).
-- A breakdown of which sensor triggered doubt (test failures, linter smells, or LLM critic verdicts).
-- A machine-readable report in `out/report.json`.
-- An interactive HTML heatmap in `out/report.html`.
-
-### Running the Web App (Streamlit)
-Launch the interactive Correctness Probability Map:
-```bash
+```sh
+python -m pip install -e ".[dev,app]"
+python -m pcg.pipeline demo/candidate.py --json out/review.json
+python -m pcg.pipeline demo/candidate.py -t demo/test_candidate.py --execution local --json out/review.json
 streamlit run app.py
 ```
 
-### Running Tests
-Execute the framework test suite:
-```bash
-pytest
+`local` executes **trusted source and tests only**. CLI and dashboard execution are disabled by default. To analyse untrusted code, build the isolated worker and select Docker:
+
+```sh
+docker build -f deploy/Dockerfile.worker -t pcg-worker:latest deploy
+python -m pcg.pipeline demo/candidate.py -t demo/test_candidate.py --execution docker
 ```
 
-### Running Calibration & Weight Fitting
-To regenerate the mutant corpus, extract features, and fit the logistic regression weights:
-```bash
-python scripts/run_calibration.py
-# or equivalently:
-python -m pcg.calibrate
+The worker has no network, host mounts, application secrets or writable root filesystem, and has CPU, memory, process and time limits. Docker availability is mandatory; failures never fall back to local execution. Set `PCG_PUBLIC_DEPLOYMENT=1` on a hosted dashboard to prohibit local execution. See [deployment guidance](docs/deployment.md) before hosting.
+
+## Probabilistic model
+
+Each code block has a binary latent defect variable. Structural priors and aggregated compiler/static/optional LLM observations supply local likelihoods. Covered test outcomes supply shared noisy-OR factors. Exact enumeration handles small connected components; larger components use seeded multi-chain Gibbs sampling with mixing diagnostics.
+
+The original code graph remains central: dependency paths define downstream trust queries over the **joint** defect posterior. Shared ancestors are counted once, and recursive call graphs do not create invalid Bayesian-network cycles.
+
+Reports expose defect probability, output trust, inherited doubt, execution status, inference method and Monte Carlo standard error. Optional next-test candidates are ranked by estimated information gain per second.
+
+## Validation and test strength
+
+```sh
+python -m pytest -q
+python -m ruff check pcg tests scripts deploy app.py
+python -m pcg.validation --demo --execution local
+python -m pcg.validation --dataset data/cases.json --execution docker
+python -m pcg.pipeline demo/candidate.py --model out/validation/sensor_model.json
 ```
 
-### Running the Evaluation Harness
-By default this scores against three built-in, hand-labelled cases covering statistics, search, and text-processing defects. The mutation corpus is used by the calibration pipeline; the evaluator and calibration runner are currently separate workflows.
-```bash
-python -m pcg.evaluate
-```
+The demo benchmark is synthetic. User datasets must explicitly separate whole repositories into training, validation and test splits. Runtime evaluation compares the full graph model, fusion without dependency edges, tests alone and static analysis alone. Thresholds are selected on validation data only. Model files are explicit and versioned; legacy fitted weights are never loaded automatically.
 
----
+For a candidate with a passing baseline suite, `--mutation-audit 20` measures test strength. Surviving mutations are not automatically declared equivalent. Repairs must preserve every previously passing test identity, retain the entire suite, and resolve at least one failure.
 
-## ── Codebase Layout ──
+## Project layout
 
-```
-pcg/
-  ├── blocks.py             # AST parser and hierarchical block decomposer
-  ├── graph.py              # Dependency constraint graph constructor
-  ├── evidence.py           # Multi-sensor evidence collection (pylint, pytest, AST, LLM critic)
-  ├── critic.py             # LLM code reviewer (Anthropic Claude API + deterministic Mock)
-  ├── inference.py          # Prior computation, Naive Bayes fusion, Noisy-AND propagation
-  ├── pipeline.py           # Orchestrates the CLI, analysis pipeline, and outputs
-  ├── report.py             # Renders console reports, JSON, and HTML heatmaps
-  ├── mutate.py             # Mutant generation + load_mutant_corpus() (shared corpus cache loader)
-  ├── build_training_set.py # Feature extraction and training set compilation
-  ├── fit_weights.py        # Weights calibration via Stratified K-Fold Logistic Regression
-  └── calibrate.py          # Shim interface pointing to fit_weights.py
-critic_calibration/         # LLM critic calibration harness on real BugsInPy open-source bugs
-  ├── build_dataset.py      # Extracts paired (buggy vs fixed) code diffs from BugsInPy
-  ├── calibration_dataset.json # 80 real-world labeled examples (40 real bugs, buggy + fixed)
-  ├── llm_critic.py         # Standalone critic runner
-  ├── run_calibration.py    # Runs the critic over real bug examples and logs predictions
-  └── analyze_calibration.py # Computes Accuracy, F1, Brier score, ECE & evidence weights
-scripts/                  
-  ├── run_calibration.py    # End-to-end training and calibration runner
-  └── run_demo_analysis.py  # Simplified script to run and log demo candidate analysis
-demo/                     
-  ├── candidate.py          # Sample implementation with planted bugs
-  ├── test_candidate.py     # Test suite for candidate.py
-  └── holdout_case.py       # Separate held-out case for calibration validation
-tests/                    
-  └── test_pcg.py           # Framework verification tests
-```
+- `pcg/`: extraction, graph, observation model, inference, workers, reports and evaluation.
+- `app.py`: the dashboard, using the same pipeline as the CLI.
+- `tests/`: analytical, property-based, execution, repair-contract and UI checks.
+- `deploy/`: isolated execution image and entrypoint.
+- `demo/`: intentionally defective example and tests.
+- `critic_calibration/`: separate optional LLM-critic experiment and its datasets.
+- `experiments/archive/`: historical results from the previous model; inactive.
+- `presentation/`: preserved original presentation artifact.
+- `out/`: generated results, excluded from version control.
+
+See [model mathematics and course mapping](docs/methodology.md), [evaluation](docs/evaluation.md), and [implementation architecture](docs/architecture.md).
+
+## Current scope
+
+A candidate module is analysed at function/method/segment granularity (maximum 512 blocks). Additional Python support files can be supplied through `ExecutionConfig.files`, but dependency extraction and defect localization cover the candidate module. Dynamic dispatch, cross-module dependency inference and arbitrary project environments are outside the current graph model. Install required dependencies into a dedicated worker image.
+
+The automated Docker integration check requires a running daemon and built image. No successful Docker execution is implied by passing local tests.

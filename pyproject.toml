@@ -11,6 +11,8 @@ dependencies = [
     "scikit-learn>=1.3",
     "numpy>=1.24",
     "pandas>=2.0",
+    "pytest>=8.0,<9",
+    "coverage>=7.6,<8",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +36,12 @@ dev = [
     "ruff>=0.5",
     "vulture>=2.11",
     "types-networkx>=3.4",
+    "hypothesis>=6.100,<7",
 ]
+
+[project.scripts]
+pcg = "pcg.pipeline:main"
+pcg-validate = "pcg.validation:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -45,6 +52,7 @@ include = ["pcg*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest-tmp"
 # The suite imports `pcg` from the repo root. pytest only prepends the test
 # file's own directory to sys.path, so without this the whole suite fails to
 # collect unless the package happens to be pip-installed.
@@ -59,3 +67,8 @@ files = ["pcg"]
 [[tool.mypy.overrides]]
 module = ["sklearn.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["anthropic", "transformers.*", "torch.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

@@ -7,7 +7,19 @@ from .blocks import Block, extract_blocks
 from .evidence import Evidence, collect_all
 from .graph import build_graph, structural_importance
 from .inference import BlockPosterior, infer, repair_targets, review_ranking
-from .pipeline import Analysis, analyze
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .pipeline import Analysis, analyze
+
+
+def __getattr__(name: str):
+    if name in {"Analysis", "analyze"}:
+        from . import pipeline
+
+        return getattr(pipeline, name)
+    raise AttributeError(name)
+
 
 __version__ = "0.1.0"
 

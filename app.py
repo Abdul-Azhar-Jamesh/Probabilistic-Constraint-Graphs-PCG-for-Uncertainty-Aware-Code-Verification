@@ -27,11 +27,11 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pcg.blocks import extract_blocks  # noqa: E402
-from pcg.evidence import collect_all  # noqa: E402
-from pcg.graph import build_graph, structural_importance  # noqa: E402
-from pcg.inference import find_root_repairs, infer, repair_targets, review_ranking  # noqa: E402
+from pcg.inference import find_root_repairs, repair_targets, review_ranking  # noqa: E402
 from pcg.report import band_of  # noqa: E402
+from pcg.pipeline import analyze  # noqa: E402
+from pcg.execution import ExecutionConfig  # noqa: E402
+from pcg.sensors import SensorModel  # noqa: E402
 
 st.set_page_config(page_title="PCG — Correctness Probability Map", layout="wide")
 
@@ -67,18 +67,46 @@ with st.sidebar:
         if ut:
             tests = ut.read().decode("utf-8")
 
-    run_tests = st.checkbox("Execute tests (slower, much stronger evidence)", True)
+    execution_mode = st.selectbox(
+        "Test execution", ["Disabled", "Docker isolation", "Local trusted code"]
+    )
+    trusted = execution_mode != "Local trusted code" or st.checkbox(
+        "I trust this source and its tests to run on this machine", value=False
+    )
+    run_tests = execution_mode != "Disabled" and trusted
+    execution_backend = (
+        "docker"
+        if execution_mode == "Docker isolation"
+        else "local"
+        if run_tests
+        else "disabled"
+    )
+    import os
+
+    if os.environ.get("PCG_PUBLIC_DEPLOYMENT") == "1":
+        if execution_backend == "local":
+            st.error("Public deployments require Docker isolation for test execution.")
+            run_tests = False
+            execution_backend = "disabled"
+    uploaded_model = st.file_uploader("Optional fitted sensor model", type=["json"])
+    model_json = uploaded_model.getvalue().decode("utf-8") if uploaded_model else ""
+    inference_method = st.selectbox("Inference", ["auto", "exact", "gibbs"])
 
     st.header("Model parameters")
     st.caption(
-        "These are the hand-set constants. Move them to see how much the "
-        "conclusions actually depend on them."
+        "Sensitivity controls for assumed observation likelihoods. "
+        "Changing them invalidates any fitted calibration claim."
     )
-    rel_exec = st.slider("Reliability: execution", 0.0, 5.0, 2.8, 0.1)
+    rel_exec = 2.8  # joint test likelihoods use sensor probabilities directly
+    test_sensitivity = st.slider(
+        "P(test fails from an exercised defect)", 0.05, 0.99, 0.95, 0.01
+    )
+    test_leak = st.slider(
+        "P(test fails without a candidate defect)", 0.001, 0.30, 0.01, 0.001
+    )
     rel_compile = st.slider("Reliability: compile", 0.0, 5.0, 3.2, 0.1)
     rel_static = st.slider("Reliability: static analysis", 0.0, 5.0, 1.4, 0.1)
     rel_llm = st.slider("Reliability: LLM confidence", 0.0, 5.0, 0.45, 0.05)
-    damping = st.slider("Constraint propagation damping", 0.0, 1.0, 0.55, 0.05)
     threshold = st.slider("Abstention threshold", 0.0, 1.0, 0.5, 0.05)
 
     use_llm = st.checkbox(
@@ -113,52 +141,91 @@ def _llm_logprobs(src: str):
     return {bid: s.logprobs for bid, s in score_blocks(src, blks).items()}
 
 
-@st.cache_data(show_spinner="Analysing…")
+@st.cache_data(show_spinner="Analysing...")
 def _analyse(
     src: str,
     tst: str,
     rels: tuple,
-    damp: float,
     llm: bool,
-    critic_b: str | None = None,
+    critic_b: str | None,
+    backend: str,
+    method: str,
+    model_json: str,
+    sensitivity: float,
+    leak: float,
 ):
-    from pcg import inference
+    import json
 
-    saved = dict(inference.SOURCE_RELIABILITY)
-    inference.SOURCE_RELIABILITY.update(
-        {
-            "exec": rels[0],
-            "compile": rels[1],
-            "static": rels[2],
-            "llm": rels[3],
-            "critic": 1.2,
+    model = None
+    if model_json:
+        payload = json.loads(model_json)
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("model") != "latent-defect-noisy-or-v1"
+        ):
+            raise ValueError("Unsupported model format")
+        model = SensorModel(
+            likelihoods=payload["likelihoods"],
+            prior_coefficients=payload.get("prior_coefficients"),
+            calibrated=False,
+            posterior_threshold=payload.get("posterior_threshold", 0.5),
+        )
+    base = model or SensorModel()
+    likelihoods = {source: dict(values) for source, values in base.likelihoods.items()}
+    if not model_json:
+        likelihoods["exec"] = {
+            "flag_given_defect": sensitivity,
+            "flag_given_clean": leak,
         }
+    model = SensorModel(
+        likelihoods, base.prior_coefficients, False, base.posterior_threshold
     )
-    try:
-        blocks = extract_blocks(src)
-        g = build_graph(blocks)
-        lps = _llm_logprobs(src) if llm else None
-        ev = collect_all(src, blocks, tst or None, lps, critic_backend=critic_b)
-        imp = structural_importance(g, blocks)
-        post = infer(blocks, g, ev, imp, damping=damp)
-    finally:
-        inference.SOURCE_RELIABILITY.clear()
-        inference.SOURCE_RELIABILITY.update(saved)
-    return blocks, g, ev, post
+    reliabilities = dict(
+        zip(["exec", "compile", "static", "llm", "critic"], (*rels, 1.2))
+    )
+    return analyze(
+        src,
+        tst or None,
+        _llm_logprobs(src) if llm else None,
+        critic_backend=critic_b,
+        execution=ExecutionConfig(backend),
+        model=model,
+        reliabilities=reliabilities,
+        inference_method=method,
+    )
 
 
 try:
-    blocks, g, evidence, post = _analyse(
+    analysis = _analyse(
         source,
         tests if run_tests else "",
         (rel_exec, rel_compile, rel_static, rel_llm),
-        damping,
         use_llm,
         critic_backend,
+        execution_backend,
+        inference_method,
+        model_json,
+        test_sensitivity,
+        test_leak,
     )
-except SyntaxError as exc:
-    st.error(f"Source does not parse: {exc}")
+except (ValueError, KeyError) as exc:
+    st.error(str(exc))
     st.stop()
+blocks, g, evidence, post = (
+    analysis.blocks,
+    analysis.graph,
+    analysis.evidence,
+    analysis.posteriors,
+)
+st.caption(
+    "Model estimates concern specified behavior; they are not a proof of correctness. "
+    "Default likelihoods are assumptions until independently validated."
+)
+st.json(g.graph["inference"], expanded=False)
+if analysis.execution and not analysis.execution.valid:
+    st.warning("Test execution incomplete: " + analysis.execution.status)
+    if analysis.execution.errors:
+        st.code("\n".join(analysis.execution.errors)[:4000])
 
 by_bid = {b.bid: b for b in blocks}
 # review_ranking returns list[tuple(Block, BlockPosterior)]; convert to list of b.bids
@@ -174,9 +241,9 @@ own_fault = [bid for bid, bp in post.items() if bp.culpability > 0.5]
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Blocks", len(blocks))
 c2.metric("Below threshold", len(flagged))
-c3.metric("Own evidence bad", len(own_fault))
+c3.metric("Likely intrinsic defects", len(own_fault))
 c4.metric(
-    "Review skipped",
+    "Above trust threshold",
     f"{100 * (1 - len(flagged) / max(1, len(blocks))):.0f}%",
 )
 
@@ -192,8 +259,8 @@ with tab_map:
     import pandas as pd
     import plotly.express as px
 
-    root_bids = set(find_root_repairs(post, g, threshold=threshold))
-    repair_bids = set(repair_targets(post, threshold=threshold))
+    root_bids = set(find_root_repairs(post, g, threshold=0.5))
+    repair_bids = set(repair_targets(post, threshold=0.5))
 
     rows = []
     for bid, bp in post.items():
@@ -294,7 +361,9 @@ with tab_map:
                 "lines",
             ]
         ]
-        .style.background_gradient(subset=["Effective Trust"], cmap="RdYlGn", vmin=0, vmax=1)
+        .style.background_gradient(
+            subset=["Effective Trust"], cmap="RdYlGn", vmin=0, vmax=1
+        )
         .background_gradient(subset=["own doubt", "risk"], cmap="Reds", vmin=0, vmax=1)
         .format(
             {
@@ -321,8 +390,10 @@ with tab_map:
         color="band",
         hover_name="block",
         color_discrete_map={
-            "SAFE": "#2ca02c", "LIKELY OK": "#17becf", "UNCERTAIN": "#bcbd22",
-            "SUSPECT": "#ff7f0e", "CRITICAL": "#d62728",
+            "LIKELY OK": "#17becf",
+            "UNCERTAIN": "#bcbd22",
+            "SUSPECT": "#ff7f0e",
+            "CRITICAL": "#d62728",
         },
     )
     scat.add_vline(x=threshold, line_dash="dash", line_color="grey")
@@ -335,7 +406,7 @@ with tab_graph:
 
     st.caption(
         "An edge B → A means A depends on B, so doubt flows along the arrow. "
-        "Node colour is P(correct); size is structural importance."
+        "Node colour is estimated output trust; size is structural importance."
     )
     try:
         pos = nx.spring_layout(g, seed=7, k=1.4)
@@ -355,34 +426,52 @@ with tab_graph:
     node_t = [
         f"{by_bid[n].qualname}<br>P={post[n].posterior:.3f}"
         f"<br>own={post[n].culpability:.3f}"
-        if n in post and n in by_bid else str(n)
-        for n in g.nodes if n in pos
+        if n in post and n in by_bid
+        else str(n)
+        for n in g.nodes
+        if n in pos
     ]
     node_s = [
         14 + 26 * (post[n].importance if n in post else 0.3)
-        for n in g.nodes if n in pos
+        for n in g.nodes
+        if n in pos
     ]
 
     fig = go.Figure()
     fig.add_trace(
-        go.Scatter(x=edge_x, y=edge_y, mode="lines",
-                   line=dict(width=1, color="#bbb"), hoverinfo="none")
+        go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            line=dict(width=1, color="#bbb"),
+            hoverinfo="none",
+        )
     )
     fig.add_trace(
         go.Scatter(
-            x=node_x, y=node_y, mode="markers+text",
+            x=node_x,
+            y=node_y,
+            mode="markers+text",
             text=[by_bid[n].name if n in by_bid else n for n in g.nodes if n in pos],
-            textposition="top center", hovertext=node_t, hoverinfo="text",
+            textposition="top center",
+            hovertext=node_t,
+            hoverinfo="text",
             marker=dict(
-                size=node_s, color=node_c, colorscale="RdYlGn",
-                cmin=0, cmax=1, line=dict(width=1, color="#333"),
+                size=node_s,
+                color=node_c,
+                colorscale="RdYlGn",
+                cmin=0,
+                cmax=1,
+                line=dict(width=1, color="#333"),
                 colorbar=dict(title="P(correct)"),
             ),
         )
     )
     fig.update_layout(
-        showlegend=False, height=620,
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        showlegend=False,
+        height=620,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
         margin=dict(l=10, r=10, t=10, b=10),
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -427,9 +516,8 @@ with tab_evidence:
     import pandas as pd
 
     st.caption(
-        "Every piece of evidence, with the log-odds it contributed. Positive "
-        "evidence is discounted relative to negative: passing a test is weaker "
-        "proof of correctness than failing one is of a defect."
+        "Sensor observations and covered test outcomes. Structured test outcomes "
+        "update a joint noisy-OR likelihood, so their individual log-odds entry is zero."
     )
     from pcg.inference import evidence_log_lr
 

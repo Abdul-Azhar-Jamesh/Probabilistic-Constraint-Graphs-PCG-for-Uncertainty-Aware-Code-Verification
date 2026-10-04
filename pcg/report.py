@@ -12,7 +12,7 @@ from .inference import BlockPosterior, find_root_repairs, repair_targets, review
 
 # Risk bands drive both the console colours and the heat map.
 BANDS = [
-    (0.85, "SAFE", "green"),
+    (0.85, "LIKELY OK", "green"),
     (0.65, "LIKELY OK", "cyan"),
     (0.45, "UNCERTAIN", "yellow"),
     (0.25, "SUSPECT", "orange3"),
@@ -62,6 +62,16 @@ def render_console(
     ranked = review_ranking(post, blocks)
 
     console.rule("[bold]Correctness Probability Map")
+    console.print(
+        "[dim]Estimates depend on assumptions; they are not a correctness proof.[/dim]"
+    )
+    if "inference" in graph.graph:
+        diagnostics = graph.graph["inference"]
+        console.print(
+            f"[dim]Inference: {', '.join(diagnostics['methods'])}; "
+            f"calibrated: {diagnostics['calibrated']}; "
+            f"mixing check passed: {diagnostics['converged']}[/dim]"
+        )
 
     table = Table(show_header=True, header_style="bold", expand=False, pad_edge=False)
     table.add_column("#", justify="right", width=2)
@@ -74,6 +84,7 @@ def render_console(
     table.add_column("Imp", justify="right", width=4)
     table.add_column("Risk", justify="right", width=5)
     table.add_column("Verdict", width=9, no_wrap=True)
+    table.add_column("Tests", width=12, no_wrap=True)
 
     for i, (b, bp) in enumerate(ranked, 1):
         label, colour = band_of(bp.posterior)
@@ -88,11 +99,12 @@ def render_console(
             f"{bp.importance:.2f}",
             Text(f"{bp.risk:.3f}", style="bold " + colour),
             Text(label, style=colour),
+            bp.execution_status,
         )
     console.print(table)
     console.print(
-        "[dim]Pri=structural prior · P(ok)=posterior after propagation · "
-        "Own=doubt originating here · Inh=doubt inherited from dependencies · "
+        "[dim]Pri=structural prior · P(ok)=estimated output trust · "
+        "Own=intrinsic defect probability · Inh=doubt inherited from dependencies · "
         "Imp=structural impact · Risk=review priority[/dim]"
     )
 
@@ -135,9 +147,13 @@ def render_console(
                 )
 
     # -- targeted repair set & root analysis ---------------------------
-    root_bids = set(find_root_repairs(post, graph, threshold=threshold))
-    repair_bids = set(repair_targets(post, threshold=threshold))
-    flagged = [(b, bp) for b, bp in ranked if bp.posterior < threshold or bp.culpability >= threshold]
+    root_bids = set(find_root_repairs(post, graph, threshold=0.5))
+    repair_bids = set(repair_targets(post, threshold=0.5))
+    flagged = [
+        (b, bp)
+        for b, bp in ranked
+        if bp.posterior < threshold or bp.culpability >= threshold
+    ]
     console.print()
     console.rule("[bold]Targeted Repair & Root Defect Analysis")
     if not flagged and not repair_bids:
@@ -149,30 +165,42 @@ def render_console(
         total_loc = sum(b.loc for b in blocks)
         flagged_loc = sum(b.loc for b, _ in flagged)
         root_blocks = [(b, bp) for b, bp in flagged if b.bid in root_bids]
-        cascade_repairs = [(b, bp) for b, bp in flagged if b.bid in repair_bids and b.bid not in root_bids]
-        collateral = [(b, bp) for b, bp in flagged if b.bid not in repair_bids and bp.posterior < threshold]
+        cascade_repairs = [
+            (b, bp)
+            for b, bp in flagged
+            if b.bid in repair_bids and b.bid not in root_bids
+        ]
+        collateral = [
+            (b, bp)
+            for b, bp in flagged
+            if b.bid not in repair_bids and bp.posterior < threshold
+        ]
 
         console.print(
             f"[yellow]{len(flagged)} of {len(blocks)} blocks suspect "
             f"({flagged_loc}/{total_loc} lines = "
-            f"{100*flagged_loc/max(total_loc,1):.0f}% of the file).[/yellow]\n"
+            f"{100 * flagged_loc / max(total_loc, 1):.0f}% of the file).[/yellow]\n"
         )
         if root_blocks:
-            console.print("[bold red]ROOT DEFECTS (Fix these first — originating bugs):[/bold red]")
+            console.print(
+                "[bold red]ROOT DEFECTS (Fix these first — originating bugs):[/bold red]"
+            )
             for b, bp in sorted(root_blocks, key=lambda t: -t[1].culpability):
                 console.print(
                     f"    [bold red]>[/bold red] [bold]{b.qualname}[/bold] (lines {b.lineno}-{b.end_lineno})\n"
-                    f"       Intrinsic Correctness: {100*(1.0-bp.culpability):.1f}%  |  "
-                    f"Effective Trust: {100*bp.posterior:.1f}%  |  "
+                    f"       Intrinsic Correctness: {100 * (1.0 - bp.culpability):.1f}%  |  "
+                    f"Effective Trust: {100 * bp.posterior:.1f}%  |  "
                     f"Repair Priority: [bold red]HIGH[/bold red] (own doubt: {bp.culpability:.2f})"
                 )
         if cascade_repairs:
-            console.print("\n[bold orange3]SECONDARY REPAIRS (Subordinate defective blocks):[/bold orange3]")
+            console.print(
+                "\n[bold orange3]SECONDARY REPAIRS (Subordinate defective blocks):[/bold orange3]"
+            )
             for b, bp in sorted(cascade_repairs, key=lambda t: -t[1].culpability):
                 console.print(
                     f"    [orange3]>[/orange3] {b.qualname} (lines {b.lineno}-{b.end_lineno})\n"
-                    f"       Intrinsic Correctness: {100*(1.0-bp.culpability):.1f}%  |  "
-                    f"Effective Trust: {100*bp.posterior:.1f}%  |  "
+                    f"       Intrinsic Correctness: {100 * (1.0 - bp.culpability):.1f}%  |  "
+                    f"Effective Trust: {100 * bp.posterior:.1f}%  |  "
                     f"Repair Priority: [orange3]MEDIUM[/orange3] (own doubt: {bp.culpability:.2f})"
                 )
         if collateral:
@@ -182,16 +210,16 @@ def render_console(
             for b, bp in collateral:
                 console.print(
                     f"    [yellow]~[/yellow] {b.qualname} (lines {b.lineno}-{b.end_lineno})\n"
-                    f"       Intrinsic Correctness: {100*(1.0-bp.culpability):.1f}%  |  "
-                    f"Effective Trust: {100*bp.posterior:.1f}%  |  "
+                    f"       Intrinsic Correctness: {100 * (1.0 - bp.culpability):.1f}%  |  "
+                    f"Effective Trust: {100 * bp.posterior:.1f}%  |  "
                     f"Repair Priority: [green]LOW[/green] (inherited doubt: {bp.inherited:.2f})"
                 )
 
         root_loc = sum(b.loc for b, _ in root_blocks)
         console.print(
             f"\n[dim]Root repairs touch only {root_loc}/{total_loc} lines "
-            f"({100*root_loc/max(total_loc,1):.0f}%), leaving "
-            f"{100 - 100*root_loc/max(total_loc,1):.0f}% of the program "
+            f"({100 * root_loc / max(total_loc, 1):.0f}%), leaving "
+            f"{100 - 100 * root_loc / max(total_loc, 1):.0f}% of the program "
             f"untouched.[/dim]"
         )
 
@@ -266,6 +294,9 @@ def to_dict(
                 "culpability": bp.culpability,
                 "inherited": bp.inherited,
                 "risk": bp.risk,
+                "uncertainty": bp.uncertainty,
+                "execution_status": bp.execution_status,
+                "inference_method": bp.inference_method,
                 "verdict": band_of(bp.posterior)[0],
                 "reasons": bp.top_reasons,
                 "contributions": bp.contributions,
@@ -277,8 +308,11 @@ def to_dict(
 
 
 def write_json(path: str, data: dict) -> None:
+    from pathlib import Path
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
+        json.dump(data, fh, indent=2, allow_nan=False)
 
 
 def write_html(path: str, source: str, blocks: list[Block], post, data: dict) -> None:
@@ -318,13 +352,13 @@ def write_html(path: str, source: str, blocks: list[Block], post, data: dict) ->
         f"<tr><td>{r['rank']}</td><td><code>{html.escape(r['qualname'])}</code></td>"
         f"<td>{r['lines'][0]}&ndash;{r['lines'][1]}</td>"
         f"<td>{r['prior']:.2f}</td>"
-        f"<td style=\"color:{css_for[r['verdict']]};font-weight:600\">"
+        f'<td style="color:{css_for[r["verdict"]]};font-weight:600">'
         f"{r['posterior']:.3f}</td>"
         f"<td>{r['culpability']:.2f}</td><td>{r['inherited']:.2f}</td>"
         f"<td>{r['importance']:.2f}</td>"
         f"<td><b>{r['risk']:.3f}</b></td>"
-        f"<td style=\"color:{css_for[r['verdict']]}\">{r['verdict']}</td>"
-        f"<td class=\"why\">{html.escape('; '.join(r['reasons'][:2]))}</td></tr>"
+        f'<td style="color:{css_for[r["verdict"]]}">{r["verdict"]}</td>'
+        f'<td class="why">{html.escape("; ".join(r["reasons"][:2]))}</td></tr>'
         for r in data["ranking"]
     )
 
@@ -354,15 +388,16 @@ def write_html(path: str, source: str, blocks: list[Block], post, data: dict) ->
  .card span{{color:#656d76;font-size:12px}}
 </style>
 <h1>Correctness Probability Map</h1>
-<div class="sub">Posterior P(correct) per code block, after Bayesian fusion of
-compiler, static-analysis, execution and generator-confidence evidence,
-propagated across the constraint graph.</div>
+<div class="sub">Estimated output trust per code block, conditioned on sensor
+observations and covered test outcomes, with dependency effects queried over
+the joint defect posterior. Estimates depend on model assumptions and are not
+a proof of correctness.</div>
 <div class="cards">
-  <div class="card"><b>{s['n_blocks']}</b><span>blocks</span></div>
-  <div class="card"><b>{s['mean_posterior']:.3f}</b><span>mean P(correct)</span></div>
-  <div class="card"><b>{s['min_posterior']:.3f}</b><span>min P(correct)</span></div>
-  <div class="card"><b>{s['n_below_threshold']}</b>
-       <span>below {s['threshold']:.2f}</span></div>
+  <div class="card"><b>{s["n_blocks"]}</b><span>blocks</span></div>
+  <div class="card"><b>{s["mean_posterior"]:.3f}</b><span>mean P(correct)</span></div>
+  <div class="card"><b>{s["min_posterior"]:.3f}</b><span>min P(correct)</span></div>
+  <div class="card"><b>{s["n_below_threshold"]}</b>
+       <span>below {s["threshold"]:.2f}</span></div>
 </div>
 <h2 style="font-size:1.1rem">Review priority</h2>
 <table><thead><tr><th>#</th><th>Block</th><th>Lines</th><th>Prior</th>
@@ -373,7 +408,7 @@ block's own evidence. <b>Inh</b> = doubt inherited from its dependencies via
 constraint propagation. A block with high Inh but near-zero Own is not itself
 broken &mdash; fix its dependencies instead.</p>
 <h2 style="font-size:1.1rem">Source heat map</h2>
-<table><tbody>{''.join(rows)}</tbody></table>
+<table><tbody>{"".join(rows)}</tbody></table>
 """
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(doc)

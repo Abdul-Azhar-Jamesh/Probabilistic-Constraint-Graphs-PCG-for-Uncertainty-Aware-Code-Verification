@@ -13,7 +13,7 @@ from __future__ import annotations
 
 # --------------------------------------------------------------------------
 _STATS = (
-    '''
+    """
 def mean(xs):
     if not xs:
         return 0.0
@@ -41,8 +41,8 @@ def zscores(xs):
 
 def summarize(xs):
     return {"mean": mean(xs), "var": variance(xs), "sd": stddev(xs)}
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -70,12 +70,12 @@ def test_summarize():
     s = c.summarize([1, 2, 3])
     assert s["mean"] == 2.0
     assert abs(s["sd"] - 1.0) < 1e-9
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _SEARCH = (
-    '''
+    """
 def lower_bound(xs, target):
     lo, hi = 0, len(xs)
     while lo < hi:
@@ -101,8 +101,8 @@ def count_range(xs, lo, hi):
 def insert_sorted(xs, value):
     i = lower_bound(xs, value)
     return xs[:i] + [value] + xs[i:]
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -126,12 +126,12 @@ def test_count_range():
 def test_insert_sorted():
     assert c.insert_sorted([1, 3, 5], 4) == [1, 3, 4, 5]
     assert c.insert_sorted([], 2) == [2]
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _TEXT = (
-    '''
+    """
 def normalize(s):
     return " ".join(s.split())
 
@@ -155,8 +155,8 @@ def truncate(s, width):
 
 def title_case(s):
     return " ".join(w.capitalize() for w in words(s))
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -183,12 +183,12 @@ def test_truncate():
 
 def test_title_case():
     assert c.title_case("the  quick fox") == "The Quick Fox"
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _MATRIX = (
-    '''
+    """
 def shape(m):
     if not m:
         return (0, 0)
@@ -212,8 +212,8 @@ def trace(m):
     r, c = shape(m)
     n = min(r, c)
     return sum(m[i][i] for i in range(n))
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -238,12 +238,12 @@ def test_scale():
 def test_trace():
     assert c.trace([[1, 2], [3, 4]]) == 5
     assert c.trace([[1, 2, 3], [4, 5, 6]]) == 6
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _INVENTORY = (
-    '''
+    """
 def total_units(items):
     return sum(it["qty"] for it in items)
 
@@ -269,8 +269,8 @@ def apply_discount(items, pct):
         copy["price"] = round(it["price"] * (100 - pct) / 100, 2)
         out.append(copy)
     return out
-''',
-    '''
+""",
+    """
 import candidate as c
 
 ITEMS = [
@@ -303,12 +303,12 @@ def test_apply_discount():
     assert out[0]["price"] == 9.0
     assert ITEMS[0]["price"] == 10.0
     assert c.apply_discount(ITEMS, 0) is ITEMS
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _DATES = (
-    '''
+    """
 def is_leap(year):
     if year % 400 == 0:
         return True
@@ -334,8 +334,8 @@ def day_of_year(year, month, day):
 
 def days_in_year(year):
     return 366 if is_leap(year) else 365
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -362,12 +362,12 @@ def test_day_of_year():
 def test_days_in_year():
     assert c.days_in_year(2024) == 366
     assert c.days_in_year(2023) == 365
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _PARSING = (
-    '''
+    """
 def parse_kv(line):
     if "=" not in line:
         return None
@@ -399,7 +399,7 @@ def coerce(value):
 def build_config(text):
     raw = parse_all(text)
     return {k: coerce(v) for k, v in raw.items()}
-''',
+""",
     '''
 import candidate as c
 
@@ -440,7 +440,7 @@ def test_build_config():
 
 # --------------------------------------------------------------------------
 _GEOMETRY = (
-    '''
+    """
 def distance(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
@@ -467,8 +467,8 @@ def bounding_box(points):
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return (min(xs), min(ys), max(xs), max(ys))
-''',
-    '''
+""",
+    """
 import candidate as c
 
 SQ = [(0, 0), (0, 2), (2, 2), (2, 0)]
@@ -491,12 +491,12 @@ def test_centroid():
 
 def test_bounding_box():
     assert c.bounding_box(SQ) == (0, 0, 2, 2)
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _STACK = (
-    '''
+    """
 def make_stack():
     return []
 
@@ -529,8 +529,8 @@ def is_balanced(text):
                 return False
             s.pop()
     return len(s) == 0
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -560,12 +560,12 @@ def test_balanced():
     assert not c.is_balanced("([)]")
     assert c.is_balanced("")
     assert not c.is_balanced("((")
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _GRAPH = (
-    '''
+    """
 def make_graph():
     return {}
 
@@ -596,8 +596,8 @@ def bfs(g, start):
 
 def has_path(g, start, end):
     return end in bfs(g, start)
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -628,12 +628,12 @@ def test_has_path():
     c.add_edge(g, "b", "c")
     assert c.has_path(g, "a", "c")
     assert not c.has_path(g, "a", "z")
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _INTERVAL = (
-    '''
+    """
 def overlaps(a, b):
     return a[0] < b[1] and b[0] < a[1]
 
@@ -663,8 +663,8 @@ def merge_all(intervals):
         else:
             merged.append(iv)
     return merged
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -694,12 +694,12 @@ def test_merge_all():
     assert c.merge_all([(1, 3), (2, 5), (8, 10)]) == [(1, 5), (8, 10)]
     assert c.merge_all([]) == []
     assert c.merge_all([(1, 10), (2, 3)]) == [(1, 10)]
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
 _CACHE = (
-    '''
+    """
 def make_cache(capacity):
     return {"cap": capacity, "keys": [], "store": {}}
 
@@ -728,8 +728,8 @@ def cache_size(cache):
 
 def cache_keys(cache):
     return list(cache["keys"])
-''',
-    '''
+""",
+    """
 import candidate as c
 
 
@@ -770,7 +770,7 @@ def test_cache_keys():
     c.cache_put(ca, "x", 10)
     c.cache_put(ca, "y", 20)
     assert c.cache_keys(ca) == ["x", "y"]
-''',
+""",
 )
 
 
@@ -808,7 +808,7 @@ def rank(xs):
     sorted_xs = merge_sort(list(xs))
     return [sorted_xs.index(x) for x in xs]
 ''',
-    '''
+    """
 import candidate as c
 
 
@@ -834,7 +834,7 @@ def test_is_sorted():
 def test_rank():
     assert c.rank([3, 1, 2]) == [2, 0, 1]
     assert c.rank([10]) == [0]
-''',
+""",
 )
 
 # --------------------------------------------------------------------------
@@ -881,7 +881,7 @@ def rle_compress_ratio(s):
     encoded = rle_encode(s)
     return len(encoded) / len(s)
 ''',
-    '''
+    """
 import candidate as c
 
 
@@ -917,7 +917,7 @@ def test_rle_compress_ratio():
     assert c.rle_compress_ratio('') == 0.0
     assert c.rle_compress_ratio('aaaa') < 1.0
     assert c.rle_compress_ratio('abcd') == 1.0
-''',
+""",
 )
 
 

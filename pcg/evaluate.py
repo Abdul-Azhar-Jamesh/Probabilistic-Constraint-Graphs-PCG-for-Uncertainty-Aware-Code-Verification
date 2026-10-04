@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from .inference import PROJECT_ROOT, brier_score, expected_calibration_error
 from .pipeline import analyze
+from .sensors import SensorModel
 
 
 @dataclass
@@ -57,7 +58,7 @@ def _load_builtin_cases() -> list[Case]:
     code are not labelled buggy, which is exactly the distinction the
     culpability decomposition is meant to capture.
     """
-    stats_src = '''
+    stats_src = """
 def mean(xs):
     return sum(xs) / len(xs)
 
@@ -81,8 +82,8 @@ def stdev(xs):
 
 def summarize(xs):
     return {"mean": mean(xs), "median": median(xs), "stdev": stdev(xs)}
-'''
-    stats_tests = '''
+"""
+    stats_tests = """
 import pytest
 from candidate import mean, median, variance, stdev, summarize
 
@@ -103,9 +104,9 @@ def test_stdev():
 
 def test_summarize():
     assert summarize([1, 2, 3, 4])["median"] == 2.5
-'''
+"""
 
-    search_src = '''
+    search_src = """
 def binary_search(xs, target):
     lo, hi = 0, len(xs)
     while lo < hi:
@@ -125,8 +126,8 @@ def contains(xs, target):
 
 def count_range(xs, lo, hi):
     return sum(1 for x in xs if lo <= x <= hi)
-'''
-    search_tests = '''
+"""
+    search_tests = """
 from candidate import binary_search, contains, count_range
 
 def test_found():
@@ -140,9 +141,9 @@ def test_contains():
 
 def test_count_range():
     assert count_range([1, 2, 3, 4, 5], 2, 4) == 3
-'''
+"""
 
-    text_src = '''
+    text_src = """
 def word_count(text):
     return len(text.split())
 
@@ -160,8 +161,8 @@ def truncate(text, n):
     if len(text) < n:
         return text
     return text[:n] + "..."
-'''
-    text_tests = '''
+"""
+    text_tests = """
 from candidate import word_count, capitalize_all, initials, truncate
 
 def test_word_count():
@@ -178,7 +179,7 @@ def test_initials_double_space():
 
 def test_truncate_exact():
     assert truncate("abcde", 5) == "abcde"
-'''
+"""
 
     return [
         Case(
@@ -207,7 +208,11 @@ def test_truncate_exact():
 
 
 def _prf(flagged_true: int, flagged_false: int, missed: int) -> dict:
-    p = flagged_true / (flagged_true + flagged_false) if (flagged_true + flagged_false) else 0.0
+    p = (
+        flagged_true / (flagged_true + flagged_false)
+        if (flagged_true + flagged_false)
+        else 0.0
+    )
     r = flagged_true / (flagged_true + missed) if (flagged_true + missed) else 0.0
     f = 2 * p * r / (p + r) if (p + r) else 0.0
     return {
@@ -220,16 +225,24 @@ def _prf(flagged_true: int, flagged_false: int, missed: int) -> dict:
     }
 
 
-def evaluate(cases: list[Case] | None = None, threshold: float = 0.5) -> dict:
-    cases = cases or _load_builtin_cases()
+def evaluate(
+    cases: list[Case] | None = None,
+    threshold: float = 0.5,
+    *,
+    model: SensorModel | None = None,
+    reliabilities: dict[str, float] | None = None,
+) -> dict:
+    cases = _load_builtin_cases() if cases is None else cases
+    if not cases:
+        raise ValueError("evaluation requires at least one case")
     rows: list[dict] = []
 
     for case in cases:
-        a = analyze(case.source, case.tests)
+        a = analyze(case.source, case.tests, model=model, reliabilities=reliabilities)
         bmap = {b.bid: b for b in a.blocks}
         for bid, bp in a.posteriors.items():
             b = bmap[bid]
-            if b.kind == "module":
+            if b.kind in {"module", "segment"}:
                 continue
             rows.append(
                 {
@@ -284,9 +297,7 @@ def evaluate(cases: list[Case] | None = None, threshold: float = 0.5) -> dict:
                 depth = i
                 break
     p_at_k = {
-        k: round(
-            sum(1 for r in ranked[:k] if r["is_buggy"]) / min(k, len(ranked)), 3
-        )
+        k: round(sum(1 for r in ranked[:k] if r["is_buggy"]) / min(k, len(ranked)), 3)
         for k in (1, 3, 5)
     }
 
@@ -341,8 +352,7 @@ def main() -> None:
         f"F1 {t['f1']:.3f}   [dim]TP={t['tp']} FP={t['fp']} FN={t['fn']}[/dim]"
     )
     console.print(
-        f"  ECE {t['calibration']['ece']:.4f}   "
-        f"Brier {t['calibration']['brier']:.4f}\n"
+        f"  ECE {t['calibration']['ece']:.4f}   Brier {t['calibration']['brier']:.4f}\n"
     )
 
     console.print(
@@ -354,8 +364,7 @@ def main() -> None:
         f"F1 {b['f1']:.3f}   [dim]TP={b['tp']} FP={b['fp']} FN={b['fn']}[/dim]"
     )
     console.print(
-        f"  ECE {b['calibration']['ece']:.4f}   "
-        f"Brier {b['calibration']['brier']:.4f}\n"
+        f"  ECE {b['calibration']['ece']:.4f}   Brier {b['calibration']['brier']:.4f}\n"
     )
 
     r = res["ranking"]
@@ -369,7 +378,7 @@ def main() -> None:
         f"[dim](random order would need ~{r['random_baseline_depth']})[/dim]"
     )
     console.print(
-        f"  [green]{100*r['review_effort_saved']:.0f}% of manual review "
+        f"  [green]{100 * r['review_effort_saved']:.0f}% of manual review "
         f"skipped[/green]\n"
     )
 
@@ -397,9 +406,7 @@ def main() -> None:
             return "[bold red]MISS[/bold red]"
 
         truth_label = (
-            "BUG"
-            if row["is_buggy"]
-            else "downstream" if row["is_unreliable"] else "ok"
+            "BUG" if row["is_buggy"] else "downstream" if row["is_unreliable"] else "ok"
         )
         tbl.add_row(
             row["case"],

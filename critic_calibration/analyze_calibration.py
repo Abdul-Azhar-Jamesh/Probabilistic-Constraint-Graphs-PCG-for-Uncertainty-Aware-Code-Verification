@@ -133,8 +133,10 @@ def plot_reliability(rows, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default="calibration_results.json")
-    ap.add_argument("--plot-out", default="reliability_diagram.png")
+    root = Path(__file__).resolve().parent
+    ap.add_argument("--results", default=str(root / "calibration_results.json"))
+    ap.add_argument("--plot-out", default=str(root / "reliability_diagram.png"))
+    ap.add_argument("--summary-out", default=str(root / "calibration_summary.json"))
     ap.add_argument("--bins", type=int, default=5)
     args = ap.parse_args()
 
@@ -173,8 +175,8 @@ def main():
 
     summary = {"metrics": metrics, "brier_score": brier, "ece": ece,
                "reliability_bins": rows, "suggested_weight": weight, "dropped": dropped}
-    Path("calibration_summary.json").write_text(json.dumps(summary, indent=2))
-    print("Wrote calibration_summary.json")
+    Path(args.summary_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Wrote {args.summary_out}")
 
 
 if __name__ == "__main__":

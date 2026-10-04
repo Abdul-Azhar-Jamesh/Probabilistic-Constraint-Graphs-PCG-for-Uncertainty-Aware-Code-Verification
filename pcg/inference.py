@@ -1,25 +1,12 @@
-"""Bayesian inference over the Probabilistic Constraint Graph.
+"""Graph-based latent-defect inference and output reliability queries.
 
-Model
------
-Each block i carries a latent binary variable C_i ("this block is correct").
-We want P(C_i = 1 | E), the posterior given all collected evidence.
+Local observation likelihoods update structural priors. Shared, coverage-backed
+noisy-OR test factors condition the joint defect model. Exact enumeration or
+Gibbs sampling supplies posterior marginals. Dependency paths then determine
+output trust while preserving correlations and counting each ancestor once.
 
-Three stages:
-
-1. **Prior** P(C_i) from structural complexity. Simple, short, low-branching
-   blocks are a priori more likely correct.
-
-2. **Local update** via naive-Bayes over conditionally-independent evidence
-   items, applied in log-odds space. Each evidence item contributes a
-   likelihood ratio derived from its source reliability and weight.
-
-3. **Constraint propagation** over the graph. A block cannot be more correct
-   than the things it depends on: we apply a noisy-AND over parents, then
-   iterate to a fixed point so that evidence reaches transitive dependents.
-
-Stage 3 is what makes this a *graph* method rather than per-block scoring, and
-it is where a bug in a leaf utility correctly drags down every caller.
+Legacy propagation and weight-loading helpers remain for research compatibility;
+the deployed infer() path does not activate legacy calibration artifacts.
 """
 
 from __future__ import annotations
@@ -33,6 +20,8 @@ import networkx as nx
 
 from .blocks import Block
 from .evidence import Evidence
+from .probabilistic import TestFactor, condition_defects, dependency_impacts
+from .sensors import SensorModel
 
 # Per-source reliability: how much a single observation from this source
 # should move belief. These are the sensor model's tunable parameters and are
@@ -69,7 +58,9 @@ def load_selected_threshold(default: float = 0.5) -> float:
         with open(SELECTED_THRESHOLD_PATH, encoding="utf-8") as fh:
             payload = json.load(fh)
         if isinstance(payload, dict):
-            value = payload.get("posterior_threshold", payload.get("selected_threshold"))
+            value = payload.get(
+                "posterior_threshold", payload.get("selected_threshold")
+            )
             if isinstance(value, (int, float)):
                 return float(value)
     except (json.JSONDecodeError, OSError):
@@ -77,11 +68,13 @@ def load_selected_threshold(default: float = 0.5) -> float:
     return default
 
 
-def classify_abstention(p: float, threshold: float = 0.5, calibration_ece: float = 0.05) -> str:
-    """Three-way posteriors: trusted, uncertain, or defective.
+def classify_abstention(
+    p: float, threshold: float = 0.5, calibration_ece: float = 0.05
+) -> str:
+    """Three-way scores: likely correct, uncertain, or defective.
 
-    The uncertain band is anchored on the validation-selected threshold and grows
-    with calibration error, so the interval is empirical rather than arbitrary.
+    The review band is a policy margin. Supply independently measured calibration
+    error explicitly; the default is a conservative display assumption.
     """
     margin = max(0.05, 0.5 * calibration_ece + 0.05)
     if p >= threshold + margin:
@@ -118,7 +111,9 @@ def _load_fitted_weights() -> dict | None:
         return None
 
 
-_FITTED = _load_fitted_weights()
+# Legacy calibration files score a different model and are never activated
+# implicitly. Compatible observation models are passed explicitly per request.
+_FITTED = None
 
 SOURCE_RELIABILITY: dict[str, float] = (
     _FITTED["source_reliability_fitted"]
@@ -163,7 +158,9 @@ class BlockPosterior:
     risk: float = 0.0
     culpability: float = 0.0  # doubt originating *here*, not inherited
     inherited: float = 0.0  # doubt arriving from dependencies
-    uncertainty: float = 0.0  # std of posterior under sensor-model resampling
+    uncertainty: float = 0.0  # Monte Carlo standard error of the trust query
+    execution_status: str = "untested"
+    inference_method: str = "exact"
     direct_negative: float = 0.0
     direct_positive: float = 0.0
     contributions: list[tuple[str, float]] = field(default_factory=list)
@@ -185,14 +182,18 @@ class BlockPosterior:
         return self.posterior
 
 
-def prior_correctness(b: Block) -> float:
-    """Structural prior on P(correct).
-
-    Anchored at 0.86 for a trivial block, decaying with complexity. The
-    coefficients (including the intercept) are loaded from fitted weights
-    (``out/fitted_weights.json``) when available, otherwise falling back to
-    the hand-tuned defaults.
-    """
+def prior_correctness(b: Block, model: SensorModel | None = None) -> float:
+    """Structural prior; fitted logistic coefficients retain their original link."""
+    if model and model.prior_coefficients is not None:
+        c = model.prior_coefficients
+        value = (
+            c["intercept"]
+            + c["log_cyclomatic"] * math.log1p(b.cyclomatic - 1)
+            + c["log_loc"] * math.log1p(b.loc)
+            + c["depth"] * b.depth
+            + c["n_params"] * b.n_params
+        )
+        return _sigmoid(value)
     c = _PRIOR_COEFFICIENTS
     penalty = (
         c["log_cyclomatic"] * math.log1p(b.cyclomatic - 1)
@@ -201,31 +202,47 @@ def prior_correctness(b: Block) -> float:
         + c["n_params"] * b.n_params
     )
     if b.kind == "module":
-        penalty *= 0.6  # module-level glue is usually simple assignments
-    base = 0.86 * math.exp(-penalty)
-    # Fitted models express their anchor as logit(intercept); apply it only
-    # when a calibrated intercept is actually present so hand-tuned behaviour
-    # is unchanged.
-    if _FITTED and "prior_coefficients_fitted" in _FITTED:
-        intercept = float(_PRIOR_COEFFICIENTS.get("intercept", 0.0))
-        base = _sigmoid(_logit(base) + intercept)
-    return min(0.93, max(0.25, base))
+        penalty *= 0.6
+    return min(0.93, max(0.25, 0.86 * math.exp(-penalty)))
 
 
-def evidence_log_lr(e: Evidence) -> float:
-    """Log-likelihood ratio log[ P(e|correct) / P(e|incorrect) ].
+def evidence_log_lr(
+    e: Evidence,
+    model: SensorModel | None = None,
+    reliabilities: dict[str, float] | None = None,
+) -> float:
+    """Log P(observation|clean)/P(observation|defective).
 
-    Positive evidence pushes toward correct, negative away. Magnitude scales
-    with source reliability and the observation's own weight, with positives
-    discounted (absence of evidence of a bug is weak evidence of absence).
+    Each source's aggregated finding is a Bernoulli observation. Tempering by
+    severity is an explicit power likelihood, not a measured probability.
+    Structured test outcomes are handled jointly by noisy-OR factors instead.
     """
-    rel = SOURCE_RELIABILITY.get(e.source, 1.0)
-    mag = rel * e.weight
-    return mag * POSITIVE_DISCOUNT if e.polarity == "positive" else -mag
+    if (
+        e.polarity == "neutral"
+        or e.meta.get("test_observation")
+        or e.kind == "confidence_proxy"
+    ):
+        return 0.0
+    model = model or SensorModel()
+    sensor = model.likelihoods.get(e.source)
+    if sensor is None:
+        return 0.0
+    defect, clean = sensor["flag_given_defect"], sensor["flag_given_clean"]
+    lr = (
+        math.log(clean / defect)
+        if e.polarity == "negative"
+        else math.log((1 - clean) / (1 - defect))
+    )
+    rel = (reliabilities or SOURCE_RELIABILITY).get(e.source, 1.0)
+    default = SOURCE_RELIABILITY_HANDTUNED.get(e.source, 1.0)
+    return lr * min(1.0, max(0.0, e.weight)) * rel / default
 
 
 def local_posteriors(
-    blocks: list[Block], evidence: list[Evidence]
+    blocks: list[Block],
+    evidence: list[Evidence],
+    model: SensorModel | None = None,
+    reliabilities: dict[str, float] | None = None,
 ) -> dict[str, BlockPosterior]:
     """Stage 1 + 2: prior, then naive-Bayes evidence fusion."""
     by_block: dict[str, list[Evidence]] = {b.bid: [] for b in blocks}
@@ -235,13 +252,25 @@ def local_posteriors(
 
     out: dict[str, BlockPosterior] = {}
     for b in blocks:
-        pri = prior_correctness(b)
+        pri = prior_correctness(b, model)
         lo = _logit(pri)
         contribs: list[tuple[str, float]] = []
         direct_negative = 0.0
         direct_positive = 0.0
+        # A linter emits correlated messages. Aggregate by source, retaining
+        # the strongest finding rather than multiplying duplicate likelihoods.
+        aggregated: dict[str, Evidence] = {}
         for e in by_block[b.bid]:
-            d = evidence_log_lr(e)
+            if e.meta.get("test_observation") or e.polarity == "neutral":
+                continue
+            previous = aggregated.get(e.source)
+            if previous is None or (e.polarity == "negative", e.weight) > (
+                previous.polarity == "negative",
+                previous.weight,
+            ):
+                aggregated[e.source] = e
+        for e in aggregated.values():
+            d = evidence_log_lr(e, model, reliabilities)
             lo += d
             if e.polarity == "negative":
                 direct_negative += abs(d)
@@ -249,6 +278,8 @@ def local_posteriors(
                 direct_positive += d
             contribs.append((f"{e.source}:{e.kind}", round(d, 3)))
         p = _sigmoid(lo)
+        if any(e.kind in {"syntax_error", "compile_error"} for e in by_block[b.bid]):
+            p = 0.0001  # observed inability to compile is a hard trust failure
         contribs.sort(key=lambda t: t[1])
         out[b.bid] = BlockPosterior(
             bid=b.bid,
@@ -319,62 +350,14 @@ def propagate_bidirectional(
     iterations: int = 12,
     damping: float = 0.55,
 ) -> dict[str, BlockPosterior]:
-    """Two-direction Bayesian message passing over the constraint graph.
+    """Compatibility wrapper for cycle-safe graph reliability queries.
 
-    The classic noisy-AND only pushes doubt *upward* (callee -> caller). But
-    evidence flows both ways in a Bayesian network:
-
-    **Upward (doubt):** if my callee is broken, I am probably wrong — the
-    noisy-AND factor, as in `propagate`.
-
-    **Downward (exoneration):** if my caller executed and its tests PASSED,
-    then I probably behaved correctly for that input — a passing caller is
-    likelihood evidence FOR my correctness. Formally, P(C_j | C_i=1, test
-    through i passed) > P(C_j). We implement this as a soft upward lift:
-
-        support(j) += sum_i s_ij * (P(C_i) - local_i)   for callers i
-
-    where a caller whose posterior exceeds its own local belief has
-    "vouched" for its dependencies. This lets clean top-level tests partially
-    exonerate leaf utilities that no test directly covers — something pure
-    noisy-AND can never express.
-
-    Both messages are damped and iterated to a fixed point.
+    Reverse inference comes from conditioning shared test factors in infer().
+    This wrapper evaluates dependency impact without inventing reverse support.
     """
-    belief = {bid: bp.local for bid, bp in post.items()}
-    local = {bid: bp.local for bid, bp in post.items()}
-
-    for _ in range(iterations):
-        delta = 0.0
-        nxt = dict(belief)
-        for bid in g.nodes:
-            if bid not in post:
-                continue
-            # Upward: noisy-AND over dependencies (doubt from below).
-            up_factor = 1.0
-            for parent in g.predecessors(bid):
-                s = g.edges[parent, bid].get("strength", 0.5)
-                up_factor *= 1.0 - s * (1.0 - belief.get(parent, 1.0))
-            # Downward: exoneration from passing callers (support from above).
-            down_lift = 0.0
-            for child in g.successors(bid):
-                if child not in post:
-                    continue
-                s = g.edges[bid, child].get("strength", 0.5)
-                vouch = max(0.0, belief.get(child, 0.0) - local[child])
-                down_lift += s * vouch
-            target = min(1.0, local[bid] * up_factor + 0.30 * down_lift)
-            new = damping * belief[bid] + (1 - damping) * target
-            delta = max(delta, abs(new - belief[bid]))
-            nxt[bid] = new
-        belief = nxt
-        if delta < 1e-5:
-            break
-
+    posterior = condition_defects({bid: 1 - bp.local for bid, bp in post.items()}, [])
     for bid, bp in post.items():
-        p = min(max(belief.get(bid, bp.local), 1e-4), 1 - 1e-4)
-        bp.posterior = round(p, 4)
-        bp.entropy = round(-(p * math.log2(p) + (1 - p) * math.log2(1 - p)), 4)
+        bp.posterior = round(posterior.trust(dependency_impacts(g, bid))[0], 4)
     return post
 
 
@@ -387,11 +370,11 @@ def sample_posteriors(
     """Monte-Carlo uncertainty over the sensor model.
 
     The naive-Bayes fusion treats evidence weights as exact. They are not:
-    they are estimates of sensor behaviour. We model each source's reliability
-    as a Beta distribution centred on its nominal value and resample the
+    they are estimates of sensor behaviour. We jitter each source reliability multiplicatively
+    with log-normal draws and resample the
     fusion `n_samples` times. Returns per block (mean, std) of the local
     posterior — the std is an honest "how sure is the model about itself"
-    number that downstream UIs can surface.
+    sensitivity diagnostic. Runtime infer() reports sampling error separately.
 
     Blocks whose evidence comes from one unreliable source get wide intervals;
     blocks with converging multi-source evidence stay tight.
@@ -440,40 +423,80 @@ def infer(
     evidence: list[Evidence],
     importance: dict[str, float] | None = None,
     damping: float = 0.55,
+    *,
+    model: SensorModel | None = None,
+    reliabilities: dict[str, float] | None = None,
+    method: str = "auto",
+    seed: int = 7,
 ) -> dict[str, BlockPosterior]:
-    """Full pipeline: prior -> evidence fusion -> constraint propagation."""
-    post = local_posteriors(blocks, evidence)
-    post = propagate_bidirectional(g, post, damping=damping)
-    if importance:
-        for bid, bp in post.items():
-            bp.importance = round(importance.get(bid, 0.0), 4)
-
-    # Monte-Carlo sensor-model uncertainty: how stable is each posterior if
-    # the evidence weights themselves are uncertain?
-    try:
-        mc = sample_posteriors(evidence, blocks)
-        for bid, (_, std) in mc.items():
-            if bid in post:
-                post[bid].uncertainty = std
-    except Exception:
-        pass  # uncertainty is supplementary; never fail the analysis for it
-
-    # Decompose total doubt into what originates here vs. what was inherited
-    # from dependencies. Only direct evidence determines culpability and repair.
-    for bid, bp in post.items():
-        bp.culpability = round(
-            bp.direct_negative
-            / (1.0 + bp.direct_negative + max(bp.direct_positive, 0.0)),
-            4,
+    """Condition latent defects on covered tests, then query graph output trust."""
+    if not 0 <= damping <= 1:
+        raise ValueError("damping must be in [0, 1]")
+    model = model or SensorModel()
+    if reliabilities is not None and any(
+        type(value) not in {float, int} or not math.isfinite(value) or value < 0
+        for value in reliabilities.values()
+    ):
+        raise ValueError("source reliabilities must be finite and nonnegative")
+    post = local_posteriors(blocks, evidence, model, reliabilities)
+    observed = {}
+    for item in evidence:
+        observation = item.meta.get("test_observation")
+        if observation:
+            observed[observation["name"]] = observation
+    factors = [
+        TestFactor(
+            row["name"],
+            tuple(row["blocks"]),
+            row["failed"],
+            model.likelihoods["exec"]["flag_given_defect"],
+            model.likelihoods["exec"]["flag_given_clean"],
         )
-        bp.inherited = round(max(0.0, bp.local - bp.posterior), 4)
-
+        for row in observed.values()
+    ]
+    posterior = condition_defects(
+        {bid: max(1e-6, min(1 - 1e-6, 1 - bp.local)) for bid, bp in post.items()},
+        factors,
+        method=method,
+        seed=seed,
+    )
+    g.graph["inference"] = {
+        **posterior.diagnostics,
+        "calibrated": model.calibrated,
+        "probability_scope": "specified behavior and observed test evidence",
+        "uncertainty_kind": "Monte Carlo standard error; zero for exact inference",
+    }
+    # Retain the joint model for optional next-test decisions; reports export
+    # only the serializable diagnostics, not its arrays.
+    g.graph["defect_posterior"] = posterior
+    marginal = posterior.marginals
     for bid, bp in post.items():
+        bp.local = round(1 - marginal[bid], 4)
+        trust, se = posterior.trust(dependency_impacts(g, bid))
+        bp.posterior = round(trust, 4)
+        bp.culpability = round(marginal[bid], 4)
+        bp.inherited = round(max(0.0, bp.local - trust), 4)
+        bp.uncertainty = round(se, 6)
+        p = min(1 - 1e-12, max(1e-12, trust))
+        bp.entropy = round(-p * math.log2(p) - (1 - p) * math.log2(1 - p), 4)
+        bp.importance = round((importance or {}).get(bid, 0.0), 4)
+        own = [e for e in evidence if e.bid == bid]
+        statuses = [
+            e.meta["execution_status"] for e in own if "execution_status" in e.meta
+        ]
+        bp.execution_status = (
+            statuses[0]
+            if statuses
+            else "tested"
+            if any(e.meta.get("test_observation") for e in own)
+            else "untested"
+        )
+        bp.inference_method = next(
+            c.method for c in posterior.components if bid in c.nodes
+        )
         weight = 0.55 + 0.45 * bp.importance if importance else 1.0
-        # Explicit risk formulation balancing own defect, inherited doubt, and entropy
         bp.risk = round(
-            (0.70 * bp.culpability + 0.20 * bp.inherited + 0.10 * bp.entropy)
-            * weight,
+            (0.70 * bp.culpability + 0.20 * bp.inherited + 0.10 * bp.entropy) * weight,
             4,
         )
     return post
@@ -525,17 +548,19 @@ def find_root_repairs(
     have an upstream dependency that is also a candidate, isolating the
     originating defect rather than cascade effects.
     """
-    candidates = {
-        bid for bid, bp in post.items() if bp.culpability >= threshold
-    }
+    candidates = {bid for bid, bp in post.items() if bp.culpability >= threshold}
 
-    roots = []
-    for bid in candidates:
-        upstream_bad = any(
-            parent in candidates for parent in graph.predecessors(bid)
-        )
-        if not upstream_bad:
-            roots.append(bid)
+    # Collapse recursion before selecting roots. Otherwise a cycle of suspects
+    # suppresses every member and yields an empty repair recommendation.
+    condensed = nx.condensation(graph)
+    mapping = condensed.graph["mapping"]
+    suspect_components = {mapping[bid] for bid in candidates if bid in mapping}
+    root_components = {
+        component
+        for component in suspect_components
+        if not (nx.ancestors(condensed, component) & suspect_components)
+    }
+    roots = [bid for bid in candidates if mapping.get(bid) in root_components]
 
     return sorted(roots, key=lambda b: -post[b].culpability)
 
@@ -563,7 +588,11 @@ def selected_threshold_from_validation(
         fn = sum(1 for p, y in zip(preds, labels) if p == 0 and y == 1)
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        f1 = (
+            (2 * precision * recall / (precision + recall))
+            if (precision + recall)
+            else 0.0
+        )
         score = f1 if metric == "f1" else precision if metric == "precision" else recall
         if score > best_value:
             best_value = score
@@ -576,7 +605,9 @@ def save_selected_threshold(threshold: float, out_dir: str = "out") -> None:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "selected_threshold.json")
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"selected_threshold": float(threshold), "metric": "f1"}, fh, indent=2)
+        json.dump(
+            {"selected_threshold": float(threshold), "metric": "f1"}, fh, indent=2
+        )
 
 
 def save_selected_thresholds(
@@ -584,12 +615,18 @@ def save_selected_thresholds(
 ) -> None:
     """Persist independently selected validation thresholds."""
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "selected_threshold.json"), "w", encoding="utf-8") as fh:
-        json.dump({
-            "posterior_threshold": float(posterior_threshold),
-            "culpability_threshold": float(culpability_threshold),
-            "metric": "f1",
-        }, fh, indent=2)
+    with open(
+        os.path.join(out_dir, "selected_threshold.json"), "w", encoding="utf-8"
+    ) as fh:
+        json.dump(
+            {
+                "posterior_threshold": float(posterior_threshold),
+                "culpability_threshold": float(culpability_threshold),
+                "metric": "f1",
+            },
+            fh,
+            indent=2,
+        )
 
 
 def expected_calibration_error(

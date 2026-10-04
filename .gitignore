@@ -1,21 +1,27 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp/
+.test-tmp*/
+.hypothesis/
 .ruff_cache/
 .mypy_cache/
 .coverage
 .venv/
 venv/
 env/
+*.egg-info/
+build/
+dist/
 
 # Generated analysis and calibration outputs
+out/
 out/*.csv
 out/*.json
 out/*.pkl
 out/*.html
 out/*.txt
-!out/fitted_weights.json
-!out/selected_threshold.json
+out/validation/
 results/**/*.csv
 results/**/*.json
 results/**/*.pkl

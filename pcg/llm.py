@@ -219,4 +219,6 @@ def token_logprobs_for(
     source: str, blocks: list[Block], model_name: str = DEFAULT_MODEL
 ) -> dict[str, list[float]]:
     """Convenience wrapper matching the `token_logprobs` hook in `analyze()`."""
-    return {bid: s.logprobs for bid, s in score_blocks(source, blocks, model_name).items()}
+    return {
+        bid: s.logprobs for bid, s in score_blocks(source, blocks, model_name).items()
+    }

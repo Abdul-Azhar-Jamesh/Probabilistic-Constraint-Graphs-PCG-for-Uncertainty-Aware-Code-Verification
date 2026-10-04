@@ -14,7 +14,6 @@ import csv
 import json
 import math
 import os
-import pickle
 from dataclasses import asdict, dataclass
 
 from .blocks import Block, extract_blocks
@@ -33,7 +32,7 @@ def _load_mutation_cases(
     Parameters
     ----------
     use_cache:
-        Load from ``out/corpus_mutants.pkl`` when it exists.  Set to
+        Load from ``out/corpus_mutants.json`` when it exists.  Set to
         ``False`` (or delete the file) after adding new reference programs.
     max_mutants:
         Cap the number of mutants returned.  Useful during fast iteration
@@ -42,28 +41,40 @@ def _load_mutation_cases(
     verbose:
         Print progress messages.
     """
-    cache_path = os.path.join("out", "corpus_mutants.pkl")
+    cache_path = os.path.join("out", "corpus_mutants.json")
 
     if use_cache and os.path.exists(cache_path):
         if verbose:
             print("Loading cached mutant corpus...")
-        with open(cache_path, "rb") as fh:
-            mutants: list[Mutant] = pickle.load(fh)
+        with open(cache_path, encoding="utf-8") as fh:
+            rows = json.load(fh)
+        mutants = [
+            Mutant(**{**row, "downstream": set(row.get("downstream", []))})
+            for row in rows
+        ]
     else:
         if verbose:
             print("Building mutant corpus (this takes a few minutes)...")
         mutants = build_corpus(verbose=verbose)
         mutants = annotate_downstream(mutants)
         os.makedirs("out", exist_ok=True)
-        with open(cache_path, "wb") as fh:
-            pickle.dump(mutants, fh)
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                [
+                    {**asdict(mutant), "downstream": sorted(mutant.downstream)}
+                    for mutant in mutants
+                ],
+                fh,
+            )
 
     if max_mutants is not None:
         mutants = mutants[:max_mutants]
 
     if verbose:
-        print(f"Corpus: {len(mutants)} detectable mutants"
-              f"{f' (capped at {max_mutants})' if max_mutants is not None else ''}")
+        print(
+            f"Corpus: {len(mutants)} detectable mutants"
+            f"{f' (capped at {max_mutants})' if max_mutants is not None else ''}"
+        )
 
     return mutants
 
@@ -123,22 +134,37 @@ class BlockFeatures:
 
 
 EVIDENCE_FEATURE_NAMES = [
-    "compile_neg_count", "compile_pos_count",
-    "static_neg_count", "static_pos_count",
-    "exec_neg_count", "exec_pos_count",
-    "llm_neg_count", "llm_pos_count",
-    "critic_neg_count", "critic_pos_count",
-    "compile_neg_weight_sum", "compile_pos_weight_sum",
-    "static_neg_weight_sum", "static_pos_weight_sum",
-    "exec_neg_weight_sum", "exec_pos_weight_sum",
-    "llm_neg_weight_sum", "llm_pos_weight_sum",
-    "critic_neg_weight_sum", "critic_pos_weight_sum",
-    "static_exec_interaction", "static_critic_interaction",
-    "exec_critic_interaction", "llm_critic_interaction",
+    "compile_neg_count",
+    "compile_pos_count",
+    "static_neg_count",
+    "static_pos_count",
+    "exec_neg_count",
+    "exec_pos_count",
+    "llm_neg_count",
+    "llm_pos_count",
+    "critic_neg_count",
+    "critic_pos_count",
+    "compile_neg_weight_sum",
+    "compile_pos_weight_sum",
+    "static_neg_weight_sum",
+    "static_pos_weight_sum",
+    "exec_neg_weight_sum",
+    "exec_pos_weight_sum",
+    "llm_neg_weight_sum",
+    "llm_pos_weight_sum",
+    "critic_neg_weight_sum",
+    "critic_pos_weight_sum",
+    "static_exec_interaction",
+    "static_critic_interaction",
+    "exec_critic_interaction",
+    "llm_critic_interaction",
 ]
 
 STRUCTURAL_FEATURE_NAMES = [
-    "log_cyclomatic", "log_loc", "depth", "n_params",
+    "log_cyclomatic",
+    "log_loc",
+    "depth",
+    "n_params",
 ]
 
 ALL_FEATURE_NAMES = EVIDENCE_FEATURE_NAMES + STRUCTURAL_FEATURE_NAMES
@@ -156,12 +182,17 @@ def _extract_block_features(
     try:
         blocks = extract_blocks(source)
     except SyntaxError:
-        blocks = [Block(
-            bid=f"function:{next(iter(buggy_qualnames), '<syntax error>')}",
-            kind="function", name=next(iter(buggy_qualnames), "<syntax error>"),
-            qualname=next(iter(buggy_qualnames), "<syntax error>"), lineno=1,
-            end_lineno=max(1, source.count("\n") + 1), source=source,
-        )]
+        blocks = [
+            Block(
+                bid=f"function:{next(iter(buggy_qualnames), '<syntax error>')}",
+                kind="function",
+                name=next(iter(buggy_qualnames), "<syntax error>"),
+                qualname=next(iter(buggy_qualnames), "<syntax error>"),
+                lineno=1,
+                end_lineno=max(1, source.count("\n") + 1),
+                source=source,
+            )
+        ]
 
     if not blocks:
         return []
@@ -213,7 +244,8 @@ def _extract_block_features(
         # Pairwise evidence interactions are derived from the existing signed
         # evidence strengths, not arbitrary tuning knobs.
         net = {
-            src: getattr(bf, f"{src}_neg_weight_sum") - getattr(bf, f"{src}_pos_weight_sum")
+            src: getattr(bf, f"{src}_neg_weight_sum")
+            - getattr(bf, f"{src}_pos_weight_sum")
             for src in ("static", "exec", "llm", "critic")
         }
         bf.static_exec_interaction = net["static"] * net["exec"]
@@ -259,7 +291,7 @@ def build_training_set(
     Parameters
     ----------
     use_cache:
-        Re-use ``out/corpus_mutants.pkl`` when it exists.
+        Re-use ``out/corpus_mutants.json`` when it exists.
     max_mutants:
         Passed through to :func:`_load_mutation_cases`.  Cap the mutant
         count for fast iteration (e.g. ``max_mutants=40``).
@@ -288,8 +320,10 @@ def build_training_set(
         )
         all_features.extend(feats)
         if verbose and (i + 1) % 10 == 0:
-            print(f"  processed {i + 1}/{len(mutants)} mutants "
-                  f"({len(all_features)} block samples so far)")
+            print(
+                f"  processed {i + 1}/{len(mutants)} mutants "
+                f"({len(all_features)} block samples so far)"
+            )
 
     # -- Step 3: add clean reference programs as all-correct examples ------
     if verbose:
@@ -308,8 +342,10 @@ def build_training_set(
     if verbose:
         n_correct = sum(1 for f in all_features if f.label == 1)
         n_buggy = sum(1 for f in all_features if f.label == 0)
-        print(f"\nTraining set: {len(all_features)} block samples "
-              f"({n_correct} correct, {n_buggy} buggy/downstream)")
+        print(
+            f"\nTraining set: {len(all_features)} block samples "
+            f"({n_correct} correct, {n_buggy} buggy/downstream)"
+        )
 
     return all_features
 

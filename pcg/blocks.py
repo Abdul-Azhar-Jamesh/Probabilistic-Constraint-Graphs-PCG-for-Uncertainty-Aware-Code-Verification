@@ -97,11 +97,12 @@ class _BodyAnalyzer(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         fn = node.func
         if isinstance(fn, ast.Name):
-            self.calls.add(fn.id)
             if fn.id not in self.local:
+                self.calls.add(fn.id)
                 self.reads.add(fn.id)
         elif isinstance(fn, ast.Attribute):
-            self.calls.add(fn.attr)
+            # Preserve the receiver: unrelated classes can have same-named methods.
+            self.calls.add(ast.unparse(fn))
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If) -> None:
