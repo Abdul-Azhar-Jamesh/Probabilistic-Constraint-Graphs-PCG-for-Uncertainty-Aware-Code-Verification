@@ -13,6 +13,9 @@ dependencies = [
     "pandas>=2.0",
     "pytest>=8.0,<9",
     "coverage>=7.6,<8",
+    "hypothesis>=6.100,<7",
+    "z3-solver>=4.13,<5",
+    "ruff>=0.5,<1",
 ]
 
 [project.optional-dependencies]
@@ -27,8 +30,9 @@ llm = [
 critic = [
     "anthropic>=0.40",
 ]
-calibration = [
-    "unidiff>=0.7",
+benchmark = [
+    "tqdm>=4.66,<5",
+    "tornado>=6.4,<7",
 ]
 dev = [
     "pytest>=7.4",
@@ -42,6 +46,7 @@ dev = [
 [project.scripts]
 pcg = "pcg.pipeline:main"
 pcg-validate = "pcg.validation:main"
+pcg-project = "pcg.project:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -66,6 +71,14 @@ files = ["pcg"]
 # so these imports are unresolvable by design rather than a missing dev install.
 [[tool.mypy.overrides]]
 module = ["sklearn.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["z3.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pcg_worker_trace"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

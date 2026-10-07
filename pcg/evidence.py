@@ -279,22 +279,128 @@ def _ast_smells(source: str, blocks: list[Block]) -> list[Evidence]:
                                     f"== used with {cmp.value!r} (line {node.lineno})",
                                 )
                             )
-        # Division without a guarded denominator is a classic off-by-zero.
+        # Check simple dominating guards; safe guarded division is not a finding.
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv)):
-            if not isinstance(node.right, ast.Constant):
+            zero_literal = (
+                isinstance(node.right, ast.Constant)
+                and isinstance(node.right.value, (int, float))
+                and node.right.value == 0
+            )
+            if zero_literal or (
+                not isinstance(node.right, ast.Constant)
+                and not _nonzero_guarded(tree, node)
+            ):
                 bid = owner.get(node.lineno)
                 if bid:
                     out.append(
                         Evidence(
                             bid,
                             "static",
-                            "unguarded_division",
+                            "zero_denominator"
+                            if zero_literal
+                            else "unguarded_division",
                             "negative",
-                            0.30,
-                            f"division by non-constant (line {node.lineno})",
+                            0.95 if zero_literal else 0.30,
+                            f"{'literal zero denominator' if zero_literal else 'no simple dominating nonzero guard found'} (line {node.lineno})",
                         )
                     )
     return out
+
+
+def _nonzero_guarded(tree: ast.AST, division: ast.BinOp) -> bool:
+    """Recognize narrow, checkable guards; unknown cases remain heuristic clues."""
+    import operator
+
+    if not isinstance(division.right, ast.Name):
+        return False
+    scopes = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.lineno <= division.lineno <= (n.end_lineno or n.lineno)
+    ]
+    if scopes:
+        tree = min(scopes, key=lambda n: (n.end_lineno or n.lineno) - n.lineno)
+    name = division.right.id
+    ops = {
+        ast.Eq: operator.eq,
+        ast.NotEq: operator.ne,
+        ast.Lt: operator.lt,
+        ast.LtE: operator.le,
+        ast.Gt: operator.gt,
+        ast.GtE: operator.ge,
+    }
+
+    def excludes(test: ast.expr, branch: bool) -> bool:
+        if isinstance(test, ast.Name) and test.id == name:
+            return branch
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return excludes(test.operand, not branch)
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and type(test.ops[0]) in ops
+        ):
+            a, b = test.left, test.comparators[0]
+            if (
+                isinstance(a, ast.Name)
+                and a.id == name
+                and isinstance(b, ast.Constant)
+                and isinstance(b.value, (int, float))
+            ):
+                return ops[type(test.ops[0])](0, b.value) != branch
+            if (
+                isinstance(b, ast.Name)
+                and b.id == name
+                and isinstance(a, ast.Constant)
+                and isinstance(a.value, (int, float))
+            ):
+                return ops[type(test.ops[0])](a.value, 0) != branch
+        return False
+
+    def changed(nodes: list[ast.stmt], start: int) -> bool:
+        return any(
+            isinstance(n, ast.Name)
+            and n.id == name
+            and isinstance(n.ctx, (ast.Store, ast.Del))
+            and start <= n.lineno <= division.lineno
+            for s in nodes
+            for n in ast.walk(s)
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            for branch, body in ((True, node.body), (False, node.orelse)):
+                if (
+                    any(
+                        s.lineno <= division.lineno <= (s.end_lineno or s.lineno)
+                        for s in body
+                    )
+                    and excludes(node.test, branch)
+                    and not changed(body, node.lineno)
+                ):
+                    return True
+        # A preceding `if d == 0: return/raise` dominates later siblings.
+        for _, body in ast.iter_fields(node):
+            if not isinstance(body, list) or not all(
+                isinstance(s, ast.stmt) for s in body
+            ):
+                continue
+            for i, stmt in enumerate(body):
+                if (
+                    isinstance(stmt, ast.If)
+                    and (stmt.end_lineno or stmt.lineno) < division.lineno
+                    and excludes(stmt.test, False)
+                    and stmt.body
+                    and isinstance(stmt.body[-1], (ast.Return, ast.Raise))
+                ):
+                    later = body[i + 1 :]
+                    if any(
+                        s.lineno <= division.lineno <= (s.end_lineno or s.lineno)
+                        for s in later
+                    ) and not changed(later, stmt.lineno):
+                        return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -303,12 +409,25 @@ def _ast_smells(source: str, blocks: list[Block]) -> list[Evidence]:
 def execution_evidence(result: ExecutionResult, blocks: list[Block]) -> list[Evidence]:
     """Attach observations only to covered blocks; keep harness errors neutral."""
     owner = line_to_block(blocks)
+    bmap = {block.bid: block for block in blocks}
     spectra = {
-        test.nodeid: {owner[line] for line in test.lines if line in owner}
+        test.nodeid: {
+            owner[line]
+            for line in test.lines
+            if line in owner
+            and (
+                not bmap[owner[line]].body_lineno
+                or line >= bmap[owner[line]].body_lineno
+            )
+        }
         for test in result.tests
-        if test.outcome in {"passed", "failed"}
+        if test.outcome in {"passed", "failed"} and test.oracle != "probe"
     }
-    failed = result.failed_ids
+    failed = {
+        test.nodeid
+        for test in result.tests
+        if test.outcome == "failed" and test.oracle != "probe"
+    }
     scores = ochiai_localization(spectra, failed)
     evidence = []
     if result.status != "complete" or result.errors:
@@ -330,6 +449,26 @@ def execution_evidence(result: ExecutionResult, blocks: list[Block]) -> list[Evi
     for test in result.tests:
         if test.outcome not in {"passed", "failed"}:
             continue
+        if test.oracle == "probe":
+            for bid in {owner[ln] for ln in test.lines if ln in owner}:
+                evidence.append(
+                    Evidence(
+                        bid,
+                        "exec",
+                        "probe_exception"
+                        if test.outcome == "failed"
+                        else "probe_executed",
+                        "neutral",
+                        0.0,
+                        f"{test.nodeid}: {test.exception or 'executed without an output oracle'}",
+                        {
+                            "execution_status": "probed",
+                            "oracle": "probe",
+                            "lines": test.lines,
+                        },
+                    )
+                )
+            continue
         covered = spectra[test.nodeid]
         if not covered:
             continue
@@ -337,6 +476,7 @@ def execution_evidence(result: ExecutionResult, blocks: list[Block]) -> list[Evi
             "name": test.nodeid,
             "blocks": sorted(covered),
             "failed": test.outcome == "failed",
+            "oracle_scope": test.oracle_scope,
         }
         frame_blocks = {owner[ln] for ln in test.frames if ln in owner}
         for bid in sorted(covered):
@@ -355,6 +495,7 @@ def execution_evidence(result: ExecutionResult, blocks: list[Block]) -> list[Evi
                         "lines": test.lines,
                         "branches": test.arcs,
                         "duration": test.duration,
+                        "oracle": test.oracle,
                     },
                 )
             )

@@ -251,14 +251,24 @@ def dependency_impacts(graph: nx.DiGraph, target: str) -> dict[str, float]:
     return {node: math.exp(-distance) for node, distance in distances.items()}
 
 
-def rank_next_tests(posterior: DefectPosterior, candidates: list[dict]) -> list[dict]:
+def rank_next_tests(
+    posterior: DefectPosterior,
+    candidates: list[dict],
+    *,
+    sensitivity: float = 0.95,
+    leak: float = 0.01,
+) -> list[dict]:
     """Rank named, covered candidate tests by expected information per second."""
     ranked = []
     for candidate in candidates:
         cost = float(candidate.get("cost_seconds", 1.0))
         if not math.isfinite(cost) or cost <= 0:
             raise ValueError("test cost must be finite and positive")
-        gain = posterior.information_gain(tuple(candidate["blocks"]))
+        gain = posterior.information_gain(
+            tuple(candidate["blocks"]),
+            float(candidate.get("sensitivity", sensitivity)),
+            leak,
+        )
         ranked.append(
             {
                 "name": candidate["name"],

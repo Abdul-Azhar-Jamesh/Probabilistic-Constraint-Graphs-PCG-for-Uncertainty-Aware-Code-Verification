@@ -36,6 +36,8 @@ A failed shared test couples possible causes and permits explaining away: eviden
 
 ## Code graph and trust query
 
+The graph now includes projected statement data/control dependencies, simple call aliases, and loop-carried definitions. Complete-statement segments can also localize short multi-stage functions. A function's baseline prior is partitioned across its header and segments rather than multiplied as a new defect budget per fragment. Containment is an identity relation with coupling 1. The extra graph structure and allocation are explicit modelling assumptions requiring re-evaluation of old fitted parameters.
+
 The directed code graph remains dependency-to-dependent. It may contain recursive cycles; it is not itself labelled a Bayesian network.
 
 For target block b, let a_ib be the product of coupling strengths along the strongest dependency path from i to b, with a_bb=1. Each reachable intrinsic defect is counted once. Cycles cannot repeatedly amplify impact.
@@ -47,6 +49,8 @@ The expectation is evaluated over joint posterior states, preserving correlation
 `culpability` is P(D_b=1|E). `local` is intrinsic correctness after all evidence. `posterior` is effective output trust. `inherited` is the nonnegative difference between intrinsic correctness and effective trust.
 
 ## Decision support
+
+See [graph-guided testing](graph-testing.md) for generated boundary probes, opt-in annotation checks, reusable properties, example contracts and failure slices. Oracle-free probes remain neutral; executed static slices identify possible earlier origins without manufacturing new independent evidence. The generated-check recommendations use joint-posterior information gain, labelled static coverage forecasts and an assumed unit cost.
 
 A candidate next test has a predicted coverage set and an estimated runtime cost. Expected information gain is I(D;T_next|E), estimated using posterior draws and the conditional test-outcome entropy. Candidates are ranked by information gain divided by cost. Predictions depend on the specified coverage and likelihood assumptions.
 

@@ -15,4 +15,6 @@ The structured runner is shared by analysis, mutation detection and repair. Harn
 
 Optional real critic calls send snippets to an external API only when explicitly selected. Mock critic results are an experiment, not independent real-world validation.
 
-Generated outputs live under `out/`. Historical calibration artifacts live under `experiments/archive/` and are inactive. There is one dashboard entrypoint and one current runtime calibration/evaluation entrypoint.
+Generated outputs live under `out/`. Obsolete calibration experiments and fitted artifacts have been removed. `validation.py` is the current model calibration/evaluation entrypoint.
+
+Project input follows `project.py`: bounded discovery preserves the file tree, `project_graph.py` connects per-file blocks and resolvable cross-module calls, and a conservative statement CFG includes loops and exception handlers. `runtime_trace.py` instruments source only inside the execution worker. Bounded event records track executed definitions, field writes, control dependencies and callee results for individual calls. The project report distinguishes this executed slice from static may-dependence and aggregate per-test coverage. Adaptive tests use first-round coverage to target unseen branches; only the final round enters Bayesian inference. Optional execution caching fingerprints snapshot, targets, worker code, configuration and environment.

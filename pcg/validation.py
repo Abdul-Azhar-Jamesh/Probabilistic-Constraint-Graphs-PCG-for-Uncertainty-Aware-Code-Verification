@@ -189,7 +189,12 @@ def predict_cases(
     rows = []
     for case in cases:
         blocks, evidence = case["blocks"], case["evidence"]
-        graph = build_graph(blocks)
+        graph = build_graph(
+            blocks,
+            source=None
+            if any(b.bid == "module:syntax-error" for b in blocks)
+            else case["case"]["source"],
+        )
         if variant == "without_graph":
             graph.remove_edges_from(list(graph.edges))
         elif variant in {"tests_only", "static_only"}:
@@ -291,6 +296,8 @@ def demo_dataset() -> list[dict]:
         # Keep all generated candidates for checking; surviving mutants are
         # not called equivalent. The CLI filters undetected synthetic mutants.
         for mutant in generate_mutants(name, source, tests, max_per_operator=1)[:2]:
+            # Label construction stays independent of new statement edges.
+            # These are synthetic call-graph labels, not real-world ground truth.
             graph = build_graph(extract_blocks(mutant.source))
             root = next(
                 (

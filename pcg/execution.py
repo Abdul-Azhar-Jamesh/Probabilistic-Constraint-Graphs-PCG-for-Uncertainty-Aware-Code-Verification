@@ -24,6 +24,7 @@ class ExecutionConfig:
     image: str = "pcg-worker:latest"
     max_output_bytes: int = 2_000_000
     files: dict[str, str] = field(default_factory=dict)
+    python_executable: str | None = None
 
     def __post_init__(self):
         if self.backend not in {"local", "docker", "disabled"}:
@@ -64,6 +65,14 @@ class TestOutcome:
     exception: str | None = None
     lines: list[int] = field(default_factory=list)
     arcs: list[list[int]] = field(default_factory=list)
+    oracle: str = "user"
+    initialization_lines: list[int] = field(default_factory=list)
+    oracle_scope: str = "user"
+    failure_details: str | None = None
+    file_lines: dict[str, list[int]] = field(default_factory=dict)
+    file_arcs: dict[str, list[list[int]]] = field(default_factory=dict)
+    file_frames: list[dict] = field(default_factory=list)
+    traces: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -116,22 +125,78 @@ def run_tests(
     config = config or ExecutionConfig()
     if len(source.encode()) > 2_000_000 or len(tests.encode()) > 2_000_000:
         raise ValueError("candidate source or tests exceed the worker input limit")
+    return run_project_tests(
+        {"candidate.py": source, "test_candidate.py": tests, **config.files},
+        ["candidate.py"],
+        ["test_candidate.py"],
+        config,
+    )
+
+
+def run_project_tests(
+    files: dict[str, str],
+    source_files: list[str],
+    test_paths: list[str],
+    config: ExecutionConfig | None = None,
+    *,
+    import_roots: list[str] | None = None,
+) -> ExecutionResult:
+    """Execute a bounded snapshot preserving its original package/import layout."""
+    from pathlib import PurePosixPath
+
+    config = config or ExecutionConfig()
+    reserved = {"pcg_worker_plugin.py", "pcg_worker_trace.py", "pcg_worker_spec.json"}
+    if len(files) > 1000 or sum(len(v.encode()) for v in files.values()) > 32_000_000:
+        raise ValueError("project snapshot exceeds worker limits")
+    for name, content in files.items():
+        path = PurePosixPath(name)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or "\\" in name
+            or ":" in name
+            or name in reserved
+            or len(content.encode()) > 2_000_000
+        ):
+            raise ValueError("invalid project snapshot path or file size")
+    if not set(source_files) <= files.keys() or any(
+        p.startswith("-") or p.split("::", 1)[0] not in files for p in test_paths
+    ):
+        raise ValueError("worker source and test paths must belong to snapshot")
+    roots = import_roots or ["."]
+    if any(
+        PurePosixPath(p).is_absolute()
+        or ".." in PurePosixPath(p).parts
+        or ":" in p
+        or "\\" in p
+        for p in roots
+    ):
+        raise ValueError("invalid import root")
     if config.backend == "disabled":
         return ExecutionResult(status="disabled", backend=config.backend)
-    if not tests.strip():
+    if not test_paths or not any(
+        files[p.split("::", 1)[0]].strip() for p in test_paths
+    ):
         return ExecutionResult(status="no_tests", backend=config.backend)
     container = "pcg-" + uuid.uuid4().hex
     with tempfile.TemporaryDirectory(prefix="pcg_worker_") as wd:
         root = Path(wd)
-        (root / "candidate.py").write_text(source, encoding="utf-8")
-        (root / "test_candidate.py").write_text(tests, encoding="utf-8")
-        shutil.copyfile(
-            Path(__file__).with_name("pytest_plugin.py"), root / "pcg_worker_plugin.py"
-        )
-        for name, content in config.files.items():
+        for name, content in files.items():
             target = root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+        shutil.copyfile(
+            Path(__file__).with_name("pytest_plugin.py"), root / "pcg_worker_plugin.py"
+        )
+        shutil.copyfile(
+            Path(__file__).with_name("runtime_trace.py"), root / "pcg_worker_trace.py"
+        )
+        (root / "pcg_worker_spec.json").write_text(
+            json.dumps(
+                {"sources": source_files, "tests": test_paths, "import_roots": roots}
+            ),
+            encoding="utf-8",
+        )
         result_path = root / "results.json"
         if config.backend == "docker":
             # Feed files over stdin; the container receives no host filesystem mounts.
@@ -141,10 +206,10 @@ def run_tests(
             stream = io.BytesIO()
             with tarfile.open(fileobj=stream, mode="w") as archive:
                 for name in (
-                    "candidate.py",
-                    "test_candidate.py",
+                    *files,
                     "pcg_worker_plugin.py",
-                    *config.files,
+                    "pcg_worker_trace.py",
+                    "pcg_worker_spec.json",
                 ):
                     archive.add(root / name, arcname=name)
             command = [
@@ -170,10 +235,10 @@ def run_tests(
             env = None  # Docker receives no -e secrets from the host.
         else:
             command = [
-                sys.executable,
+                config.python_executable or sys.executable,
                 "-m",
                 "pytest",
-                "test_candidate.py",
+                *test_paths,
                 "-q",
                 "--tb=short",
                 "-p",
@@ -188,7 +253,9 @@ def run_tests(
             env.update(
                 {
                     "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-                    "PYTHONPATH": wd,
+                    "PYTHONPATH": os.pathsep.join(
+                        [str(root), *[str(root / p) for p in roots]]
+                    ),
                     "PCG_RESULT_PATH": str(result_path),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 }
@@ -223,6 +290,15 @@ def run_tests(
                         errors=["execution deadline exceeded"],
                         backend=config.backend,
                     )
+                except KeyboardInterrupt:
+                    if config.backend == "docker":
+                        subprocess.run(
+                            ["docker", "rm", "-f", container],
+                            capture_output=True,
+                            check=False,
+                        )
+                    _kill_tree(proc)
+                    raise
             if config.backend == "docker":
                 raw_path = root / "stdout.log"
                 if raw_path.stat().st_size > config.max_output_bytes:
@@ -249,7 +325,22 @@ def run_tests(
             if len({record.nodeid for record in records}) != len(records) or any(
                 record.outcome
                 not in {"passed", "failed", "error", "skipped", "xfailed", "xpassed"}
+                or record.oracle not in {"user", "contract", "annotation", "probe"}
+                or record.oracle_scope
+                not in {
+                    "user",
+                    "example",
+                    "contract",
+                    "annotation",
+                    "probe",
+                    "property",
+                    "metamorphic",
+                }
                 or any(type(line) is not int or line < 1 for line in record.lines)
+                or any(
+                    type(line) is not int or line < 1
+                    for line in record.initialization_lines
+                )
                 for record in records
             ):
                 raise ValueError(
@@ -275,14 +366,26 @@ def run_tests(
 
 def preserves_tests(baseline: ExecutionResult, candidate: ExecutionResult) -> bool:
     """Require identical test identities and no regressions in previously passing tests."""
+    baseline_checked = {t.nodeid: t for t in baseline.tests if t.oracle != "probe"}
+    candidate_checked = {t.nodeid: t for t in candidate.tests if t.oracle != "probe"}
+    baseline_passed = {n for n, t in baseline_checked.items() if t.outcome == "passed"}
+    baseline_failed = {n for n, t in baseline_checked.items() if t.outcome == "failed"}
+    candidate_passed = {
+        n for n, t in candidate_checked.items() if t.outcome == "passed"
+    }
+    candidate_failed = {
+        n for n, t in candidate_checked.items() if t.outcome == "failed"
+    }
     completed_ids = {
-        test.nodeid for test in candidate.tests if test.outcome in {"passed", "failed"}
+        n for n, t in candidate_checked.items() if t.outcome in {"passed", "failed"}
     }
     return (
         baseline.valid
         and candidate.valid
         and {t.nodeid for t in baseline.tests} == {t.nodeid for t in candidate.tests}
-        and baseline.passed_ids <= candidate.passed_ids
-        and baseline.failed_ids <= completed_ids
-        and candidate.failed_ids < baseline.failed_ids
+        and {t.nodeid: (t.oracle, t.oracle_scope) for t in baseline.tests}
+        == {t.nodeid: (t.oracle, t.oracle_scope) for t in candidate.tests}
+        and baseline_passed <= candidate_passed
+        and baseline_failed <= completed_ids
+        and candidate_failed < baseline_failed
     )

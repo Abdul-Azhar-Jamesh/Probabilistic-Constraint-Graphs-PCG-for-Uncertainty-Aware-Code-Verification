@@ -293,40 +293,6 @@ class TestCalibration:
         ece = expected_calibration_error([0.95, 0.95, 0.95], [0, 0, 0])
         assert ece > 0.9
 
-    def test_zero_reliability_values_are_not_rejected(self, tmp_path, monkeypatch):
-        from pcg import inference
-
-        model = {
-            "source_reliability_fitted": {
-                "compile": 0.0,
-                "static": 0.5521,
-                "exec": 0.9378,
-                "llm": 0.0,
-                "critic": 0.25,
-            },
-            "prior_coefficients_fitted": {
-                "log_cyclomatic": 0.0,
-                "log_loc": 0.0,
-                "depth": 0.0,
-                "n_params": 0.0,
-                "intercept": 0.0,
-            },
-        }
-        path = tmp_path / "fitted_weights.json"
-        path.write_text(__import__("json").dumps(model), encoding="utf-8")
-        monkeypatch.setattr(inference, "FITTED_WEIGHTS_PATH", str(path))
-        loaded = inference._load_fitted_weights()
-        assert loaded is not None
-        assert loaded["source_reliability_fitted"]["critic"] == 0.25
-
-    def test_sensor_likelihood_ratios_have_compile_floor(self):
-        from pcg.build_training_set import BlockFeatures
-        from pcg.fit_weights import _sensor_likelihood_ratios
-
-        features = [BlockFeatures("clean", "f", 1), BlockFeatures("bug", "f", 0)]
-        ratios = _sensor_likelihood_ratios(features)
-        assert ratios["compile"] >= 1.5
-
     def test_fault_mutants_cover_nonsemantic_failures(self):
         from pcg.mutate import generate_fault_mutants
 
@@ -337,61 +303,6 @@ class TestCalibration:
             "wrong_arg_count",
             "import_error",
         }
-
-    def test_training_labels_keep_downstream_separate_from_bug_label(self):
-        from pcg.build_training_set import _extract_block_features
-
-        features = _extract_block_features(
-            case_id="case:downstream",
-            source=SIMPLE,
-            tests="",
-            buggy_qualnames=set(),
-            downstream_qualnames={"caller"},
-            critic_backend="mock",
-        )
-        caller = next(f for f in features if f.block_qualname == "caller")
-        assert caller.label == 1
-        assert caller.is_downstream == 1
-
-    def test_training_pipeline_generates_critic_evidence(self):
-        from pcg.build_training_set import _extract_block_features
-
-        features = _extract_block_features(
-            case_id="case:critic",
-            source=SIMPLE,
-            tests="",
-            buggy_qualnames=set(),
-            downstream_qualnames=set(),
-            critic_backend="mock",
-        )
-        assert any(f.critic_neg_count or f.critic_pos_count for f in features)
-
-    def test_interaction_features_are_defined_from_strengths(self):
-        from pcg.build_training_set import _extract_block_features
-
-        features = _extract_block_features(
-            case_id="case:interactions",
-            source=SIMPLE,
-            tests="",
-            buggy_qualnames=set(),
-            downstream_qualnames=set(),
-            critic_backend="mock",
-        )
-        assert any(hasattr(f, "static_exec_interaction") for f in features)
-        assert any(hasattr(f, "static_critic_interaction") for f in features)
-        assert any(hasattr(f, "exec_critic_interaction") for f in features)
-        assert any(hasattr(f, "llm_critic_interaction") for f in features)
-
-    def test_threshold_selection_loads_saved_validation_threshold(
-        self, tmp_path, monkeypatch
-    ):
-        from pcg import inference
-
-        payload = {"selected_threshold": 0.63, "metric": "f1"}
-        path = tmp_path / "selected_threshold.json"
-        path.write_text(__import__("json").dumps(payload), encoding="utf-8")
-        monkeypatch.setattr(inference, "SELECTED_THRESHOLD_PATH", str(path))
-        assert inference.load_selected_threshold() == 0.63
 
     def test_abstention_band_uses_validation_margin(self):
         from pcg.inference import classify_abstention
@@ -408,17 +319,6 @@ class TestCalibration:
             classify_abstention(0.90, threshold=0.63, calibration_ece=0.08)
             == "LIKELY_CORRECT"
         )
-
-    def test_root_defect_metrics_compute_from_ground_truth(self):
-        from pcg.build_training_set import root_defect_metrics
-
-        metrics = root_defect_metrics(
-            truth_roots={"A", "B"},
-            predicted_roots={"B", "C"},
-        )
-        assert metrics["precision"] == pytest.approx(0.5)
-        assert metrics["recall"] == pytest.approx(0.5)
-        assert metrics["f1"] == pytest.approx(0.5)
 
 
 class TestEndToEnd:

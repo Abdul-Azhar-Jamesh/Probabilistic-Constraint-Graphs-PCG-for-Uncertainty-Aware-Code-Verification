@@ -16,6 +16,15 @@ DEFAULT_SENSORS = {
     "critic": {"flag_given_defect": 0.65, "flag_given_clean": 0.25},
 }
 
+# Assumed sensitivity of partial oracles, not learned calibration values.
+ORACLE_SENSITIVITY_SCALE = {"annotation": 0.25, "property": 0.5, "metamorphic": 0.5}
+
+
+def test_sensitivity(model: "SensorModel", scope: str) -> float:
+    return model.likelihoods["exec"][
+        "flag_given_defect"
+    ] * ORACLE_SENSITIVITY_SCALE.get(scope, 1.0)
+
 
 @dataclass(frozen=True)
 class SensorModel:

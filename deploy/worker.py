@@ -1,5 +1,6 @@
-"""Container entrypoint. Only allow the three expected input files."""
+"""Container entrypoint accepting a bounded, traversal-free project snapshot."""
 
+import json
 import os
 import subprocess
 import sys
@@ -17,12 +18,11 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
             or ".." in path.parts
             or "\\" in member.name
             or ":" in member.name
-            or not member.name.endswith(".py")
             or not member.isfile()
             or member.size > 2_000_000
             or member.name in seen
-            or len(seen) >= 203
-            or total_bytes > 20_000_000
+            or len(seen) >= 1003
+            or total_bytes > 34_000_000
         ):
             raise ValueError("invalid worker input")
         seen.add(member.name)
@@ -30,9 +30,12 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
         with archive.extractfile(member) as source:
             Path(member.name).write_bytes(source.read())
 
+spec = json.loads(Path("/work/pcg_worker_spec.json").read_text())
 env = {
     "PATH": os.environ["PATH"],
-    "PYTHONPATH": "/work",
+    "PYTHONPATH": os.pathsep.join(
+        ["/work", *[str(Path("/work") / p) for p in spec["import_roots"]]]
+    ),
     "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
     "PCG_RESULT_PATH": "/work/results.json",
@@ -43,7 +46,7 @@ with open("/work/pytest.log", "wb") as output:
             sys.executable,
             "-m",
             "pytest",
-            "test_candidate.py",
+            *spec["tests"],
             "-q",
             "-p",
             "pcg_worker_plugin",

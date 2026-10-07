@@ -25,6 +25,8 @@ EDGE_STRENGTH = {
     "calls": 0.85,
     "dataflow": 0.70,
     "sequence": 0.25,
+    "control": 0.55,
+    "contains": 1.0,
 }
 
 # Global edge strengths used in propagation. They can be replaced by fitted
@@ -33,7 +35,10 @@ LEARNED_EDGE_STRENGTH = dict(EDGE_STRENGTH)
 
 
 def build_graph(
-    blocks: list[Block], strengths: dict[str, float] | None = None
+    blocks: list[Block],
+    strengths: dict[str, float] | None = None,
+    *,
+    source: str | None = None,
 ) -> nx.DiGraph[str]:
     """Build the constraint graph.
 
@@ -104,9 +109,54 @@ def build_graph(
             g.add_edge(
                 seg.bid,
                 parent.bid,
-                kind="calls",
+                kind="contains",
                 detail=f"{parent.qualname} contains {seg.qualname}",
-                strength=edge_strengths["calls"],
+                strength=1.0,
+            )
+    # Reaching definitions replace arbitrary adjacent-segment sequence links.
+    # These edges can identify an earlier assignment as the origin of bad data.
+    if source is not None:
+        from .blocks import line_to_block
+        from .slicing import program_dependence
+
+        dependence = program_dependence(source)
+        g.graph["dependence"] = dependence
+        owner = line_to_block(blocks)
+        block_by_id = {block.bid: block for block in blocks}
+        for before, after, data in dependence.graph.edges(data=True):
+            dependency, dependent = owner.get(before), owner.get(after)
+            if not dependency or not dependent or dependency == dependent:
+                continue
+            kinds = data["kinds"]
+            # Argument-flow edges belong to the diagnostic statement graph, not
+            # global intrinsic correctness of a callee across all call contexts.
+            if kinds == ["call_argument"]:
+                continue
+            source_block, target_block = block_by_id[dependency], block_by_id[dependent]
+            if (
+                source_block.kind in {"function", "method"}
+                and target_block.kind == "segment"
+                and target_block.qualname.rsplit("#seg", 1)[0] == source_block.qualname
+            ):
+                # A header supplies parameters; the umbrella also aggregates
+                # segment trust. Do not create an artificial containment cycle.
+                continue
+            kind = (
+                "calls"
+                if any(k.startswith("call_") for k in kinds)
+                else "control"
+                if kinds == ["control"]
+                else "dataflow"
+            )
+            strength = edge_strengths.get(kind, EDGE_STRENGTH[kind])
+            existing = g.get_edge_data(dependency, dependent, {})
+            g.add_edge(
+                dependency,
+                dependent,
+                kind=existing.get("kind", kind),
+                strength=max(strength, existing.get("strength", 0)),
+                detail=existing.get("detail", f"line {before} supports line {after}"),
+                relations=sorted(set(existing.get("relations", [])) | set(kinds)),
             )
     return g
 

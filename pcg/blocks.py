@@ -37,6 +37,10 @@ class Block:
     n_loops: int = 0
     has_return: bool = False
     n_params: int = 0
+    # Exact source ownership prevents module/class spans absorbing other bodies.
+    owned_lines: set[int] = field(default_factory=set)
+    writes: set[str] = field(default_factory=set)
+    body_lineno: int = 0
 
     @property
     def loc(self) -> int:
@@ -203,6 +207,8 @@ def extract_blocks(source: str, filename: str = "<module>") -> list[Block]:
                 n_loops=an.n_loops,
                 has_return=an.has_return,
                 n_params=len(params),
+                writes=an.local - set(params),
+                body_lineno=node.body[0].lineno,
             )
         )
         # Intra-procedural splitting: a large function additionally gets
@@ -229,6 +235,7 @@ def extract_blocks(source: str, filename: str = "<module>") -> list[Block]:
                     n_loops=seg_an.n_loops,
                     has_return=seg_an.has_return,
                     n_params=len(params),
+                    writes=seg_an.local - set(params),
                 )
             )
 
@@ -264,6 +271,12 @@ def extract_blocks(source: str, filename: str = "<module>") -> list[Block]:
                         depth=an.max_depth,
                         n_branches=an.n_branches,
                         n_loops=an.n_loops,
+                        owned_lines={
+                            ln
+                            for n in non_methods
+                            for ln in range(n.lineno, _end_lineno(n) + 1)
+                        }
+                        | {node.lineno},
                     )
                 )
             for m in methods:
@@ -292,6 +305,11 @@ def extract_blocks(source: str, filename: str = "<module>") -> list[Block]:
                 depth=an.max_depth,
                 n_branches=an.n_branches,
                 n_loops=an.n_loops,
+                owned_lines={
+                    ln
+                    for n in module_level
+                    for ln in range(n.lineno, _end_lineno(n) + 1)
+                },
             )
         )
 
@@ -323,14 +341,17 @@ def _split_function_segments(
     if not stmts:
         return []
     total = _end_lineno(node) - node.lineno + 1
-    if total < SEGMENT_THRESHOLD_LOC or len(stmts) < 2:
+    if (total < SEGMENT_THRESHOLD_LOC and len(stmts) < 4) or len(stmts) < 2:
         return []
 
     segments: list[tuple[int, int]] = []
     seg_start = stmts[0].lineno
     seg_end = _end_lineno(stmts[0])
     for s in stmts[1:]:
-        if _end_lineno(s) - seg_start + 1 >= SEGMENT_TARGET_LOC:
+        if (
+            total < SEGMENT_THRESHOLD_LOC
+            or _end_lineno(s) - seg_start + 1 >= SEGMENT_TARGET_LOC
+        ):
             segments.append((seg_start, seg_end))
             seg_start = s.lineno
         seg_end = _end_lineno(s)
@@ -348,6 +369,6 @@ def line_to_block(blocks: list[Block]) -> dict[int, str]:
     """
     owner: dict[int, str] = {}
     for b in sorted(blocks, key=lambda x: x.loc, reverse=True):
-        for ln in range(b.lineno, b.end_lineno + 1):
+        for ln in b.owned_lines or range(b.lineno, b.end_lineno + 1):
             owner[ln] = b.bid
     return owner

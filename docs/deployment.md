@@ -15,7 +15,7 @@ Input sources are sent over stdin as a bounded archive. Workers receive no host 
 
 For a hosted dashboard, set `PCG_PUBLIC_DEPLOYMENT=1`. Public mode prohibits local execution. Keep the dashboard and Docker execution service on infrastructure appropriate for hostile workloads; do not mount a Docker daemon socket into an unrestricted public app container. Container restrictions are one isolation layer, not proof against kernel vulnerabilities.
 
-The worker image supports pytest, coverage and Hypothesis. Add application dependencies to a dedicated, pinned worker image and set `ExecutionConfig.image` explicitly. The current graph localizes one candidate module; `ExecutionConfig.files` supports accompanying Python modules with validated relative paths. It does not automatically reproduce arbitrary repositories or install uploaded requirements.
+The worker image supports pytest, coverage and Hypothesis. Add application dependencies to a dedicated, pinned worker image and set `ExecutionConfig.image` explicitly. Project mode preserves packages, import paths, existing tests and UTF-8 resources, and localizes resolvable cross-module dependencies. Use `python -m pcg.project PROJECT --execution docker --worker-image IMAGE`. It does not install uploaded requirements. CLI local project mode can select a preprovisioned interpreter with `--python`.
 
 ## Release checks
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import networkx as nx
 
@@ -32,6 +32,96 @@ class Analysis:
     posteriors: dict[str, BlockPosterior]
     execution: ExecutionResult | None = None
     threshold: float = 0.5
+    test_plan: dict | None = None
+    failure_diagnoses: list[dict] = field(default_factory=list)
+    generated_tests: str = ""
+    failure_validation: dict = field(default_factory=dict)
+
+    def to_dict(self, threshold: float | None = None) -> dict:
+        data = to_dict(
+            self.blocks,
+            self.posteriors,
+            self.evidence,
+            self.threshold if threshold is None else threshold,
+        )
+        data["inference"] = self.graph.graph["inference"]
+        data["execution"] = self.execution.to_dict() if self.execution else None
+        oracle_runs = (
+            [
+                t
+                for t in self.execution.tests
+                if t.oracle != "probe"
+                and t.outcome in {"passed", "failed"}
+                and t.nodeid
+                not in self.failure_validation.get("excluded_from_inference", [])
+            ]
+            if self.execution and self.execution.valid
+            else []
+        )
+        data["automatic_validation"] = {
+            "status": "oracle-failure"
+            if any(t.outcome == "failed" for t in oracle_runs)
+            else "bounded-oracle-checks"
+            if oracle_runs
+            else "no-correctness-oracle",
+            "oracle_checks": len(oracle_runs),
+            "interpretation": "Passing bounded checks is not proof of intended behavior. Unspecified behavior, unsupported interfaces, and dependencies remain unresolved.",
+        }
+        data["test_plan"] = self.test_plan
+        if self.graph.graph.get("test_targets") is not None:
+            from .graph_testing import measure_targets
+
+            data["graph_testing"] = measure_targets(
+                self.graph.graph["test_targets"], self.execution
+            )
+            data["graph_testing"]["feedback"] = self.graph.graph.get(
+                "testing_feedback", {}
+            )
+            data["control_flow_graph"] = self.graph.graph["test_targets"].to_dict()
+        data["failure_diagnoses"] = self.failure_diagnoses
+        data["failure_validation"] = self.failure_validation
+        from .project import trace_diagnoses
+
+        data["executed_diagnoses"] = trace_diagnoses(self.execution)
+        data["graph_edges"] = [
+            {"from": a, "to": b, **values}
+            for a, b, values in self.graph.edges(data=True)
+        ]
+        dependence = self.graph.graph.get("dependence")
+        if dependence is not None:
+            data["dependence"] = {
+                "statement_nodes": dependence.graph.number_of_nodes(),
+                "statement_edges": dependence.graph.number_of_edges(),
+                "unresolved_calls": dependence.graph.graph.get("unresolved_calls", []),
+            }
+            covered = (
+                {ln for t in self.execution.tests for ln in t.lines}
+                if self.execution and self.execution.valid
+                else set()
+            )
+            checked = (
+                {
+                    ln
+                    for t in self.execution.tests
+                    if t.oracle != "probe" and t.outcome in {"passed", "failed"}
+                    for ln in t.lines
+                }
+                if self.execution and self.execution.valid
+                else set()
+            )
+            data["coverage_gaps"] = [
+                {
+                    "line": ln,
+                    "scope": values["scope"],
+                    "status": "oracle-covered"
+                    if set(values["lines"]) & checked
+                    else "probe-only"
+                    if set(values["lines"]) & covered
+                    else "unexecuted",
+                }
+                for ln, values in dependence.graph.nodes(data=True)
+            ]
+        return data
 
     @property
     def ok(self) -> bool:
@@ -53,6 +143,14 @@ def analyze(
     reliabilities: dict[str, float] | None = None,
     inference_method: str = "auto",
     seed: int = 7,
+    auto_tests: bool = False,
+    contracts: list[dict] | None = None,
+    annotation_contracts: bool = False,
+    max_generated_cases: int = 40,
+    autonomous_testing: bool = False,
+    graph_guided: bool = True,
+    failure_replays: int = 0,
+    minimize_trials: int = 6,
 ) -> Analysis:
     """Run the full PCG pipeline over one Python source string."""
     try:
@@ -75,12 +173,54 @@ def analyze(
         raise ValueError("no analysable blocks found in source")
     if len(blocks) > 512:
         raise ValueError("analysis is limited to 512 blocks per candidate module")
-    g = build_graph(blocks)
+    syntax_error = any(b.bid == "module:syntax-error" for b in blocks)
+    g = build_graph(blocks, source=None if syntax_error else source)
+    plan = None
+    original_tests = tests
+    if (
+        auto_tests
+        or autonomous_testing
+        or annotation_contracts
+        or contracts is not None
+    ) and not syntax_error:
+        from .testgen import plan_tests
+
+        plan = plan_tests(
+            source,
+            blocks,
+            g,
+            contracts=contracts,
+            max_cases=max_generated_cases,
+            seed=seed,
+            annotation_contracts=annotation_contracts,
+            autonomous=autonomous_testing,
+            graph_guided=graph_guided,
+        )
+        if tests and "def test_pcg_" in tests:
+            raise ValueError("user tests use reserved generated-test names test_pcg_")
+        tests = (tests or "") + "\n" + plan.source
     execution_result = (
         run_tests(source, tests, execution)
         if tests and not any(b.bid == "module:syntax-error" for b in blocks)
         else None
     )
+    if plan is not None and g.graph.get("test_targets") is not None:
+        from .graph_testing import add_uncovered_checks, measure_targets
+
+        feedback = add_uncovered_checks(
+            plan,
+            g.graph["test_targets"],
+            execution_result,
+            source,
+            max_cases=max_generated_cases,
+        )
+        if feedback["added_checks"]:
+            tests = (original_tests or "") + "\n" + plan.source
+            execution_result = run_tests(source, tests, execution)
+        feedback["edges_after"] = measure_targets(
+            g.graph["test_targets"], execution_result
+        )["distinct_branch_edges_seen"]
+        g.graph["testing_feedback"] = feedback
     ev = collect_all(
         source,
         blocks,
@@ -90,6 +230,38 @@ def analyze(
         execution=execution,
         execution_result=execution_result,
     )
+    from .failure_validation import validate_failures
+
+    failure_validation = validate_failures(
+        {
+            "candidate.py": source,
+            "test_candidate.py": tests or "",
+            **(execution.files if execution else {}),
+        },
+        ["candidate.py"],
+        execution_result or ExecutionResult(status="no_tests"),
+        execution or ExecutionConfig(),
+        replays=failure_replays,
+        minimize_trials=minimize_trials,
+    )
+    excluded = set(failure_validation["excluded_from_inference"])
+    for item in ev:
+        observation = item.meta.get("test_observation")
+        if observation and observation["name"] in excluded:
+            item.meta.pop("test_observation")
+            item.meta["execution_status"] = "unstable"
+            item.kind, item.polarity, item.weight = "unstable_execution", "neutral", 0.0
+    if plan is not None:
+        generated = {c["name"]: c for c in plan.cases}
+        for item in ev:
+            observation = item.meta.get("test_observation")
+            if not observation:
+                continue
+            case = generated.get(observation["name"].rsplit("::", 1)[-1])
+            if case and case["oracle"] == "annotation":
+                observation["oracle_family"] = (
+                    f"generated:annotation:{case['function']}"
+                )
     imp = structural_importance(g, blocks)
     post = infer(
         blocks,
@@ -101,6 +273,20 @@ def analyze(
         method=inference_method,
         seed=seed,
     )
+    from .slicing import failure_slices
+
+    if plan is not None:
+        from .testgen import recommend_checks
+
+        plan.recommendations = recommend_checks(
+            plan, blocks, g, execution_result, model or SensorModel()
+        )
+
+    diagnoses = (
+        failure_slices(g.graph["dependence"], execution_result, blocks)
+        if "dependence" in g.graph
+        else []
+    )
     return Analysis(
         source,
         blocks,
@@ -109,10 +295,22 @@ def analyze(
         post,
         execution_result,
         model.posterior_threshold if model else 0.5,
+        plan.to_dict() if plan else None,
+        diagnoses,
+        plan.source if plan else "",
+        failure_validation,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    import sys
+    from pathlib import Path
+
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and Path(arguments[0]).is_dir():
+        from .project import main as project_main
+
+        return project_main(arguments)
     ap = argparse.ArgumentParser(
         prog="pcg",
         description="Probabilistic Constraint Graphs for uncertainty-aware "
@@ -136,7 +334,39 @@ def main(argv: list[str] | None = None) -> int:
         help="local executes trusted code; docker isolates uploaded code",
     )
     ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument(
+        "--auto-tests",
+        action="store_true",
+        help="plan and optionally execute graph-prioritized boundary probes",
+    )
+    ap.add_argument(
+        "--contracts",
+        help="JSON cases: expected outputs, expected exceptions or metamorphic relations",
+    )
+    ap.add_argument(
+        "--annotation-contracts",
+        action="store_true",
+        help="treat supported declared return annotations as test contracts",
+    )
+    ap.add_argument("--max-generated-cases", type=int, default=40)
+    ap.add_argument(
+        "--autonomous",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="automatically generate shrinking fuzz checks and discover existing doctest/type contracts",
+    )
+    ap.add_argument(
+        "--graph-guided",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use dependency-sliced CFG constraints and coverage feedback for automatic tests",
+    )
+    ap.add_argument(
+        "--write-generated-tests", help="save the generated pytest suite for inspection"
+    )
     ap.add_argument("--model", help="versioned observation likelihood model JSON")
+    ap.add_argument("--failure-replays", type=int, default=2)
+    ap.add_argument("--minimize-trials", type=int, default=6)
     ap.add_argument("--inference", choices=["auto", "exact", "gibbs"], default="auto")
     ap.add_argument(
         "--next-tests", help="JSON candidates with name, block IDs, cost_seconds"
@@ -144,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--mutation-audit",
         type=int,
-        default=0,
+        default=None,
         metavar="LIMIT",
         help="audit a passing test suite with up to LIMIT mutations",
     )
@@ -161,6 +391,12 @@ def main(argv: list[str] | None = None) -> int:
             tests = fh.read()
 
     model = SensorModel.load(args.model) if args.model else None
+    import json
+
+    contracts = None
+    if args.contracts:
+        with open(args.contracts, encoding="utf-8") as fh:
+            contracts = json.load(fh)
     a = analyze(
         source,
         tests=tests,
@@ -168,6 +404,14 @@ def main(argv: list[str] | None = None) -> int:
         execution=ExecutionConfig(args.execution, args.timeout),
         model=model,
         inference_method=args.inference,
+        auto_tests=args.auto_tests or args.annotation_contracts,
+        contracts=contracts,
+        annotation_contracts=args.annotation_contracts,
+        max_generated_cases=args.max_generated_cases,
+        autonomous_testing=args.autonomous,
+        graph_guided=args.graph_guided,
+        failure_replays=args.failure_replays,
+        minimize_trials=args.minimize_trials,
     )
     threshold = args.threshold if args.threshold is not None else a.threshold
     if not 0 < threshold < 1:
@@ -176,9 +420,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.heatmap:
         render_heatmap_console(source, a.blocks, a.posteriors)
 
-    data = to_dict(a.blocks, a.posteriors, a.evidence, threshold)
-    data["inference"] = a.graph.graph["inference"]
-    data["execution"] = a.execution.to_dict() if a.execution else None
+    data = a.to_dict(threshold)
+    if args.write_generated_tests:
+        from pathlib import Path
+
+        destination = Path(args.write_generated_tests)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(a.generated_tests, encoding="utf-8")
+    if a.test_plan:
+        print(
+            f"Generated {len(a.test_plan['cases'])} cases; {len(a.test_plan['skipped'])} interfaces/cases need explicit input contracts."
+        )
+    for row in a.failure_diagnoses:
+        print(
+            f"{row['test']}: symptom lines {row['symptom_lines']}; possible earlier causes {row['candidate_cause_lines']} ({row['oracle']})"
+        )
     if args.next_tests:
         import json
         from .probabilistic import rank_next_tests
@@ -188,17 +444,42 @@ def main(argv: list[str] | None = None) -> int:
                 a.graph.graph["defect_posterior"], json.load(fh)
             )
         print(data["next_tests"])
-    if args.mutation_audit:
-        if not tests or args.execution == "disabled":
+    mutation_limit = (
+        args.mutation_audit
+        if args.mutation_audit is not None
+        else (3 if args.autonomous and args.execution != "disabled" else 0)
+    )
+    if mutation_limit:
+        effective_tests = (tests or "") + "\n" + a.generated_tests
+        if (
+            not effective_tests.strip() or args.execution == "disabled"
+        ) and args.mutation_audit is not None:
             ap.error("mutation auditing requires tests and enabled execution")
         from .test_quality import mutation_audit
 
-        data["mutation_audit"] = mutation_audit(
-            source,
-            tests,
-            max_mutants=args.mutation_audit,
-            execution=ExecutionConfig(args.execution, args.timeout),
+        eligible = (
+            a.execution
+            and a.execution.valid
+            and any(
+                t.oracle != "probe" and t.outcome == "passed" for t in a.execution.tests
+            )
+            and not any(
+                t.oracle != "probe" and t.outcome == "failed" for t in a.execution.tests
+            )
         )
+        if eligible:
+            data["mutation_audit"] = mutation_audit(
+                source,
+                effective_tests,
+                max_mutants=mutation_limit,
+                execution=ExecutionConfig(args.execution, args.timeout),
+                strengthen_generated=args.autonomous,
+            )
+        else:
+            data["mutation_audit"] = {
+                "status": "not-applicable",
+                "reason": "requires a complete passing oracle-backed baseline; probes alone cannot measure test strength",
+            }
         print(data["mutation_audit"])
     if args.json:
         write_json(args.json, data)

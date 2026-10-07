@@ -1,0 +1,7 @@
+[
+  {"function": "normalize", "property": "permutation"},
+  {"function": "normalize", "property": "sorted"},
+  {"function": "normalize", "property": "idempotent"},
+  {"function": "ratio", "args": [10, 2], "expected": 5},
+  {"function": "ratio", "args": [10, 0], "raises": "ValueError"}
+]

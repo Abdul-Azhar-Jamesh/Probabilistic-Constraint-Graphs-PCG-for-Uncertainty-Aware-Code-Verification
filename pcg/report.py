@@ -363,6 +363,36 @@ def write_html(path: str, source: str, blocks: list[Block], post, data: dict) ->
     )
 
     s = data["summary"]
+    diagnoses_html = ""
+    for diagnosis in data.get("failure_diagnoses", []):
+        diagnoses_html += (
+            "<details open><summary>"
+            + html.escape(diagnosis["test"])
+            + "</summary><p>"
+            + html.escape(
+                f"Symptoms: {diagnosis['symptom_lines']}; possible earlier causes: {diagnosis['candidate_cause_lines']}"
+            )
+            + "</p><p>"
+            + html.escape(diagnosis["interpretation"])
+            + "</p></details>"
+        )
+    if diagnoses_html:
+        diagnoses_html = (
+            '<h2 style="font-size:1.1rem">Earlier cause analysis</h2>' + diagnoses_html
+        )
+    plan_html = ""
+    if data.get("test_plan"):
+        plan_html = (
+            "<details><summary>Generated checks, oracles and coverage assumptions</summary><pre>"
+            + html.escape(json.dumps(data["test_plan"], indent=2))
+            + "</pre></details>"
+        )
+    if data.get("graph_testing"):
+        plan_html += (
+            "<details><summary>Graph-directed testing and measured coverage</summary><pre>"
+            + html.escape(json.dumps(data["graph_testing"], indent=2))
+            + "</pre></details>"
+        )
     doc = f"""<!doctype html>
 <meta charset="utf-8">
 <title>Correctness Probability Map</title>
@@ -409,6 +439,8 @@ constraint propagation. A block with high Inh but near-zero Own is not itself
 broken &mdash; fix its dependencies instead.</p>
 <h2 style="font-size:1.1rem">Source heat map</h2>
 <table><tbody>{"".join(rows)}</tbody></table>
+{diagnoses_html}
+{plan_html}
 """
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(doc)

@@ -50,7 +50,10 @@ st.caption(
 
 with st.sidebar:
     st.header("Input")
-    mode = st.radio("Source", ["Demo (planted bugs)", "Paste your own", "Upload"])
+    mode = st.radio(
+        "Source",
+        ["Demo (planted bugs)", "Paste your own", "Upload", "Upload project (.zip)"],
+    )
 
     source = tests = ""
     if mode == "Demo (planted bugs)":
@@ -59,6 +62,8 @@ with st.sidebar:
     elif mode == "Paste your own":
         source = st.text_area("Python source", height=200)
         tests = st.text_area("pytest file (optional)", height=120)
+    elif mode == "Upload project (.zip)":
+        project_upload = st.file_uploader("Python project ZIP", type=["zip"])
     else:
         up = st.file_uploader("Python file", type=["py"])
         ut = st.file_uploader("Test file (optional)", type=["py"])
@@ -91,6 +96,16 @@ with st.sidebar:
     uploaded_model = st.file_uploader("Optional fitted sensor model", type=["json"])
     model_json = uploaded_model.getvalue().decode("utf-8") if uploaded_model else ""
     inference_method = st.selectbox("Inference", ["auto", "exact", "gibbs"])
+    auto_tests = st.checkbox("Automatically explore and test this code", value=True)
+    annotation_contracts = st.checkbox(
+        "Use declared return types as test contracts", value=False
+    )
+    contracts_json = st.text_area(
+        "Optional behavior contracts (JSON cases)", height=100
+    )
+    st.caption(
+        "Probes explore inputs without asserting correctness. Expected outputs or metamorphic contracts provide stronger checks."
+    )
 
     st.header("Model parameters")
     st.caption(
@@ -124,6 +139,48 @@ with st.sidebar:
     }
     critic_backend = critic_backend_map[critic_choice]
 
+if mode == "Upload project (.zip)":
+    import json
+    import tempfile
+    from pcg.project import analyze_project, unpack_project
+
+    st.caption(
+        "Analyse packages, existing tests and automatic graph-guided checks. Supply dependencies in the worker environment."
+    )
+    if project_upload and st.button("Analyse project"):
+        try:
+            with tempfile.TemporaryDirectory(prefix="pcg_upload_") as folder:
+                project_root = unpack_project(project_upload.getvalue(), Path(folder))
+                with st.spinner("Analysing project..."):
+                    project_report = analyze_project(
+                        project_root, execution=ExecutionConfig(execution_backend)
+                    )
+            st.session_state["project_report"] = project_report
+        except (ValueError, OSError) as exc:
+            st.error(str(exc))
+    if "project_report" in st.session_state:
+        project_report = st.session_state["project_report"]
+        st.write("Status:", project_report["status"])
+        st.json(project_report["summary"])
+        st.dataframe(project_report["ranking"], hide_index=True)
+        st.json(
+            {
+                "diagnoses": project_report["diagnoses"],
+                "static": project_report["static"],
+                "failure_validation": project_report["failure_validation"],
+                "adaptive_budget": project_report["adaptive_budget"],
+                "limitations": project_report["limitations"],
+            },
+            expanded=False,
+        )
+        st.download_button(
+            "Download project report",
+            json.dumps(project_report, indent=2),
+            "project-report.json",
+            "application/json",
+        )
+    st.stop()
+
 if not source.strip():
     st.info("Provide some Python source in the sidebar to begin.")
     st.stop()
@@ -153,6 +210,9 @@ def _analyse(
     model_json: str,
     sensitivity: float,
     leak: float,
+    auto_tests: bool,
+    annotation_contracts: bool,
+    contracts_json: str,
 ):
     import json
 
@@ -192,6 +252,11 @@ def _analyse(
         model=model,
         reliabilities=reliabilities,
         inference_method=method,
+        auto_tests=auto_tests or annotation_contracts,
+        autonomous_testing=auto_tests,
+        annotation_contracts=annotation_contracts,
+        contracts=json.loads(contracts_json) if contracts_json.strip() else None,
+        failure_replays=2,
     )
 
 
@@ -207,6 +272,9 @@ try:
         model_json,
         test_sensitivity,
         test_leak,
+        auto_tests,
+        annotation_contracts,
+        contracts_json,
     )
 except (ValueError, KeyError) as exc:
     st.error(str(exc))
@@ -222,6 +290,24 @@ st.caption(
     "Default likelihoods are assumptions until independently validated."
 )
 st.json(g.graph["inference"], expanded=False)
+if analysis.failure_validation.get("failures"):
+    st.json({"failure_validation": analysis.failure_validation}, expanded=False)
+if analysis.execution and any(t.outcome == "failed" for t in analysis.execution.tests):
+    from pcg.project import trace_diagnoses
+
+    st.json(
+        {"executed_dependency_diagnoses": trace_diagnoses(analysis.execution)},
+        expanded=False,
+    )
+if analysis.test_plan:
+    with st.expander("Generated test plan and unsupported interfaces"):
+        st.json(analysis.test_plan)
+if g.graph.get("test_targets") is not None:
+    with st.expander("Graph-directed checks and measured branch coverage"):
+        st.json(analysis.to_dict()["graph_testing"])
+if analysis.failure_diagnoses:
+    with st.expander("Trace symptoms back to possible earlier causes", expanded=True):
+        st.json(analysis.failure_diagnoses)
 if analysis.execution and not analysis.execution.valid:
     st.warning("Test execution incomplete: " + analysis.execution.status)
     if analysis.execution.errors:

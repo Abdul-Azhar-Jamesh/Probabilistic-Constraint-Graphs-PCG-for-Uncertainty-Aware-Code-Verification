@@ -10,6 +10,7 @@ Scores concern specified behavior and available evidence. They are not proofs of
 python -m pip install -e ".[dev,app]"
 python -m pcg.pipeline demo/candidate.py --json out/review.json
 python -m pcg.pipeline demo/candidate.py -t demo/test_candidate.py --execution local --json out/review.json
+python -m pcg.project path/to/python-project --execution local --cache out/cache
 streamlit run app.py
 ```
 
@@ -51,15 +52,21 @@ For a candidate with a passing baseline suite, `--mutation-audit 20` measures te
 - `tests/`: analytical, property-based, execution, repair-contract and UI checks.
 - `deploy/`: isolated execution image and entrypoint.
 - `demo/`: intentionally defective example and tests.
-- `critic_calibration/`: separate optional LLM-critic experiment and its datasets.
-- `experiments/archive/`: historical results from the previous model; inactive.
 - `presentation/`: preserved original presentation artifact.
 - `out/`: generated results, excluded from version control.
 
 See [model mathematics and course mapping](docs/methodology.md), [evaluation](docs/evaluation.md), and [implementation architecture](docs/architecture.md).
 
+For new inputs without handwritten pytest files, see [graph-guided testing and earlier-cause diagnosis](docs/graph-testing.md). Use `--auto-tests` for neutral boundary probes, `--annotation-contracts` for opt-in return checks, and `--contracts` for reusable properties or specified examples. The worked example is `demo/graph_candidate.py` with `demo/contracts.json`.
+
 ## Current scope
 
-A candidate module is analysed at function/method/segment granularity (maximum 512 blocks). Additional Python support files can be supplied through `ExecutionConfig.files`, but dependency extraction and defect localization cover the candidate module. Dynamic dispatch, cross-module dependency inference and arbitrary project environments are outside the current graph model. Install required dependencies into a dedicated worker image.
+Single-file analysis supports 512 blocks. Project analysis preserves packages, relative imports, a `src/` layout, existing pytest files and UTF-8 resources, with a 2048-block/1000-file/32 MB snapshot limit. Project graphs connect resolvable imports and calls, represent loops and exception flow conservatively, and use individual executed dependency traces to investigate earlier causes. Automatic tests combine graph-derived inputs, Hypothesis shrinking, coverage feedback and stateful probes. Ruff adds static bug checks. Dependencies must already exist in a dedicated environment or worker image.
+
+Use `python -m pcg.project PROJECT --execution docker --worker-image YOUR_IMAGE` for isolated project execution. The dashboard also accepts project ZIP uploads. See [project usage and pipeline](docs/project-testing.md).
+
+`python scripts/real_bug_benchmark.py` runs documented compatibility replays for three published BugsInPy bug/fix pairs (tqdm, HTTPie and Luigi). The previous `real_bug_replay.py` command forwards to this expanded benchmark. Results distinguish upstream regression assertions, automatic probes and unavailable checks; they are not production accuracy or calibration claims.
+
+Project analysis reserves extra test slots using estimated Bayesian information gain, uncovered graph branches and observed cost. Failures are replayed in fresh workers; selected flaky/inconclusive results remain neutral for inference. Stable failures get bounded input/action reduction while preserving assertions, oracle provenance, symptom and captured dependency locations. Reports include accepted reproducers and validation histories. Reflection, external services, opaque object aliases, concurrency and unknown intended behavior remain limitations.
 
 The automated Docker integration check requires a running daemon and built image. No successful Docker execution is implied by passing local tests.

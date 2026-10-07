@@ -21,7 +21,7 @@ Mean token probability is the obvious choice and a poor one: it is dominated by
 trivially predictable tokens (indentation, ``def``, closing parens), so it
 mostly measures boilerplate density and correlates with block length rather
 than correctness. We therefore compute several statistics per block and let
-:mod:`pcg.calibrate` decide empirically which discriminates buggy from correct
+:mod:`pcg.validation` decide empirically which discriminates buggy from correct
 blocks on the mutation corpus.
 
 The most useful in practice is *peak surprisal*: a single wrong token (a

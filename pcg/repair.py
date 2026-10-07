@@ -525,12 +525,23 @@ def repair(
     by_bid = {b.bid: b for b in blocks}
 
     baseline = run_tests(source, tests, execution)
-    base_pass, base_fail = len(baseline.passed_ids), len(baseline.failed_ids)
+    base_pass = sum(
+        t.outcome == "passed" and t.oracle != "probe" for t in baseline.tests
+    )
+    base_fail = sum(
+        t.outcome == "failed" and t.oracle != "probe" for t in baseline.tests
+    )
     if not baseline.valid or base_fail == 0:
         return []
 
     ranked = sorted(
-        (bp for bp in posteriors.values() if bp.culpability > 0.10),
+        (
+            bp
+            for bp in posteriors.values()
+            if bp.culpability > 0.10
+            and bp.bid in by_bid
+            and by_bid[bp.bid].kind in {"function", "method", "segment"}
+        ),
         key=lambda bp: bp.culpability,
         reverse=True,
     )[:max_targets]
@@ -538,7 +549,7 @@ def repair(
     results: list[RepairResult] = []
     for bp in ranked:
         blk = by_bid.get(bp.bid)
-        if blk is None or blk.kind not in ("function", "method"):
+        if blk is None or blk.kind not in ("function", "method", "segment"):
             continue
         res = RepairResult(
             target_bid=bp.bid,
@@ -561,7 +572,12 @@ def repair(
             res.attempted += len(batch)
             found = False
             for p, outcome in zip(batch, outcomes):
-                passed, failed = len(outcome.passed_ids), len(outcome.failed_ids)
+                passed = sum(
+                    t.outcome == "passed" and t.oracle != "probe" for t in outcome.tests
+                )
+                failed = sum(
+                    t.outcome == "failed" and t.oracle != "probe" for t in outcome.tests
+                )
                 p.tests_passed, p.tests_failed = passed, failed
                 if not preserves_tests(baseline, outcome):
                     continue

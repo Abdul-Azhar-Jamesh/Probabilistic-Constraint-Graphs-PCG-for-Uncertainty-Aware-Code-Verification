@@ -5,15 +5,12 @@ noisy-OR test factors condition the joint defect model. Exact enumeration or
 Gibbs sampling supplies posterior marginals. Dependency paths then determine
 output trust while preserving correlations and counting each ancestor once.
 
-Legacy propagation and weight-loading helpers remain for research compatibility;
-the deployed infer() path does not activate legacy calibration artifacts.
+Observation models are supplied explicitly; obsolete fitted artifacts are not loaded.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import os
 from dataclasses import dataclass, field
 
 import networkx as nx
@@ -21,7 +18,7 @@ import networkx as nx
 from .blocks import Block
 from .evidence import Evidence
 from .probabilistic import TestFactor, condition_defects, dependency_impacts
-from .sensors import SensorModel
+from .sensors import SensorModel, test_sensitivity, ORACLE_SENSITIVITY_SCALE
 
 # Per-source reliability: how much a single observation from this source
 # should move belief. These are the sensor model's tunable parameters and are
@@ -43,30 +40,6 @@ PRIOR_COEFFICIENTS_HANDTUNED = {
     "n_params": 0.05,
 }
 
-# Validation-selected threshold persists in JSON so the final holdout run uses a
-# fixed threshold chosen only on validation data.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SELECTED_THRESHOLD_PATH = os.path.join(PROJECT_ROOT, "out", "selected_threshold.json")
-FITTED_WEIGHTS_PATH = os.path.join(PROJECT_ROOT, "out", "fitted_weights.json")
-
-
-def load_selected_threshold(default: float = 0.5) -> float:
-    """Load the saved validation-only threshold, if present."""
-    if not os.path.exists(SELECTED_THRESHOLD_PATH):
-        return default
-    try:
-        with open(SELECTED_THRESHOLD_PATH, encoding="utf-8") as fh:
-            payload = json.load(fh)
-        if isinstance(payload, dict):
-            value = payload.get(
-                "posterior_threshold", payload.get("selected_threshold")
-            )
-            if isinstance(value, (int, float)):
-                return float(value)
-    except (json.JSONDecodeError, OSError):
-        pass
-    return default
-
 
 def classify_abstention(
     p: float, threshold: float = 0.5, calibration_ece: float = 0.05
@@ -84,48 +57,9 @@ def classify_abstention(
     return "UNCERTAIN"
 
 
-def _load_fitted_weights() -> dict | None:
-    """Try to load fitted weights from calibration output.
+SOURCE_RELIABILITY: dict[str, float] = dict(SOURCE_RELIABILITY_HANDTUNED)
+_PRIOR_COEFFICIENTS: dict[str, float] = dict(PRIOR_COEFFICIENTS_HANDTUNED)
 
-    Resolved relative to the project root (not the CWD) so behaviour is
-    identical no matter where the pipeline is invoked from. A fit is rejected
-    only if the payload itself is malformed; zero-valued reliability entries are
-    allowed because a source may legitimately contribute no signal in a given
-    fit. The runtime still prefers a numerically valid model and will fall back
-    to hand-tuned values only when no valid calibration file exists.
-    """
-    if not os.path.exists(FITTED_WEIGHTS_PATH):
-        return None
-    try:
-        with open(FITTED_WEIGHTS_PATH, encoding="utf-8") as fh:
-            data = json.load(fh)
-            if not isinstance(data, dict):
-                return None
-            rel = data.get("source_reliability_fitted", {})
-            if not isinstance(rel, dict):
-                return None
-            if any(not isinstance(v, (int, float)) for v in rel.values()):
-                return None
-            return data
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-# Legacy calibration files score a different model and are never activated
-# implicitly. Compatible observation models are passed explicitly per request.
-_FITTED = None
-
-SOURCE_RELIABILITY: dict[str, float] = (
-    _FITTED["source_reliability_fitted"]
-    if _FITTED and "source_reliability_fitted" in _FITTED
-    else dict(SOURCE_RELIABILITY_HANDTUNED)
-)
-
-_PRIOR_COEFFICIENTS: dict[str, float] = (
-    _FITTED["prior_coefficients_fitted"]
-    if _FITTED and "prior_coefficients_fitted" in _FITTED
-    else dict(PRIOR_COEFFICIENTS_HANDTUNED)
-)
 
 # Positive evidence is discounted relative to negative evidence of the same
 # nominal weight. Passing tests and clean linters are weak proof of
@@ -251,8 +185,26 @@ def local_posteriors(
             by_block[e.bid].append(e)
 
     out: dict[str, BlockPosterior] = {}
+    priors = {b.bid: prior_correctness(b, model) for b in blocks}
+    by_qualname = {b.qualname: b for b in blocks}
+    families: dict[str, list[Block]] = {}
+    for block in blocks:
+        if block.kind == "segment":
+            families.setdefault(block.qualname.rsplit("#seg", 1)[0], []).append(block)
+    for name, segments in families.items():
+        parent = by_qualname.get(name)
+        if parent is None:
+            continue
+        baseline = priors[parent.bid]
+        # Partition a function's prior risk instead of adding a fresh independent
+        # defect budget for every fragment. Product of family priors = baseline.
+        header_weight = max(1, parent.body_lineno - parent.lineno)
+        total_weight = header_weight + sum(segment.loc for segment in segments)
+        priors[parent.bid] = baseline ** (header_weight / total_weight)
+        for segment in segments:
+            priors[segment.bid] = baseline ** (segment.loc / total_weight)
     for b in blocks:
-        pri = prior_correctness(b, model)
+        pri = priors[b.bid]
         lo = _logit(pri)
         contribs: list[tuple[str, float]] = []
         direct_negative = 0.0
@@ -444,15 +396,30 @@ def infer(
         observation = item.meta.get("test_observation")
         if observation:
             observed[observation["name"]] = observation
+    families: dict[str, list[dict]] = {}
+    for row in observed.values():
+        families.setdefault(row.get("oracle_family", row["name"]), []).append(row)
+    grouped = []
+    for name, rows in families.items():
+        # Generated repetitions of one return-type contract are a single
+        # observation family. If it failed, passing paths cannot exonerate it.
+        selected = [r for r in rows if r["failed"]] or rows
+        grouped.append(
+            {
+                **selected[0],
+                "name": name,
+                "blocks": sorted({b for r in selected for b in r["blocks"]}),
+            }
+        )
     factors = [
         TestFactor(
             row["name"],
             tuple(row["blocks"]),
             row["failed"],
-            model.likelihoods["exec"]["flag_given_defect"],
+            test_sensitivity(model, row.get("oracle_scope", "user")),
             model.likelihoods["exec"]["flag_given_clean"],
         )
-        for row in observed.values()
+        for row in grouped
     ]
     posterior = condition_defects(
         {bid: max(1e-6, min(1 - 1e-6, 1 - bp.local)) for bid, bp in post.items()},
@@ -461,10 +428,13 @@ def infer(
         seed=seed,
     )
     g.graph["inference"] = {
+        "observed_tests": len(observed),
+        "observation_families": len(grouped),
         **posterior.diagnostics,
         "calibrated": model.calibrated,
         "probability_scope": "specified behavior and observed test evidence",
         "uncertainty_kind": "Monte Carlo standard error; zero for exact inference",
+        "partial_oracle_sensitivity_scales": dict(ORACLE_SENSITIVITY_SCALE),
     }
     # Retain the joint model for optional next-test decisions; reports export
     # only the serializable diagnostics, not its arrays.
@@ -485,10 +455,10 @@ def infer(
             e.meta["execution_status"] for e in own if "execution_status" in e.meta
         ]
         bp.execution_status = (
-            statuses[0]
-            if statuses
-            else "tested"
+            "tested"
             if any(e.meta.get("test_observation") for e in own)
+            else statuses[0]
+            if statuses
             else "untested"
         )
         bp.inference_method = next(
@@ -563,70 +533,6 @@ def find_root_repairs(
     roots = [bid for bid in candidates if mapping.get(bid) in root_components]
 
     return sorted(roots, key=lambda b: -post[b].culpability)
-
-
-def selected_threshold_from_validation(
-    validation_scores: list[tuple[float, int]],
-    metric: str = "f1",
-    default: float = 0.5,
-) -> float:
-    """Choose a threshold from validation data only.
-
-    This is deliberately simple: we sweep a grid in [0.1, 0.9], score on the held-out
-    validation set, and keep the threshold that maximises the selected metric. The
-    value is saved for later final holdout use so the test split cannot be tuned.
-    """
-    if not validation_scores:
-        return default
-    best_threshold = default
-    best_value = float("-inf")
-    for threshold in [x / 100 for x in range(10, 91)]:
-        preds = [1 if p >= threshold else 0 for p, _ in validation_scores]
-        labels = [int(y) for _, y in validation_scores]
-        tp = sum(1 for p, y in zip(preds, labels) if p == 1 and y == 1)
-        fp = sum(1 for p, y in zip(preds, labels) if p == 1 and y == 0)
-        fn = sum(1 for p, y in zip(preds, labels) if p == 0 and y == 1)
-        precision = tp / (tp + fp) if (tp + fp) else 0.0
-        recall = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = (
-            (2 * precision * recall / (precision + recall))
-            if (precision + recall)
-            else 0.0
-        )
-        score = f1 if metric == "f1" else precision if metric == "precision" else recall
-        if score > best_value:
-            best_value = score
-            best_threshold = threshold
-    return round(best_threshold, 2)
-
-
-def save_selected_threshold(threshold: float, out_dir: str = "out") -> None:
-    """Persist the validation-selected threshold for the final holdout run."""
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "selected_threshold.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(
-            {"selected_threshold": float(threshold), "metric": "f1"}, fh, indent=2
-        )
-
-
-def save_selected_thresholds(
-    posterior_threshold: float, culpability_threshold: float, out_dir: str = "out"
-) -> None:
-    """Persist independently selected validation thresholds."""
-    os.makedirs(out_dir, exist_ok=True)
-    with open(
-        os.path.join(out_dir, "selected_threshold.json"), "w", encoding="utf-8"
-    ) as fh:
-        json.dump(
-            {
-                "posterior_threshold": float(posterior_threshold),
-                "culpability_threshold": float(culpability_threshold),
-                "metric": "f1",
-            },
-            fh,
-            indent=2,
-        )
 
 
 def expected_calibration_error(
