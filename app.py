@@ -162,6 +162,7 @@ if mode == "Upload project (.zip)":
         project_report = st.session_state["project_report"]
         st.write("Status:", project_report["status"])
         st.json(project_report["summary"])
+        st.json(project_report["findings"])
         st.dataframe(project_report["ranking"], hide_index=True)
         st.json(
             {
@@ -290,6 +291,8 @@ st.caption(
     "Default likelihoods are assumptions until independently validated."
 )
 st.json(g.graph["inference"], expanded=False)
+with st.expander("Observed findings and what they establish", expanded=True):
+    st.json(analysis.to_dict()["findings"])
 if analysis.failure_validation.get("failures"):
     st.json({"failure_validation": analysis.failure_validation}, expanded=False)
 if analysis.execution and any(t.outcome == "failed" for t in analysis.execution.tests):
@@ -381,16 +384,16 @@ with tab_map:
     st.subheader("Targeted Repair & Root Defect Analysis")
     col_roots, col_affected = st.columns(2)
     with col_roots:
-        st.markdown("**Root Defects (Fix these first):**")
+        st.markdown("**Possible origins (Investigate first):**")
         roots_found = [by_bid[bid].qualname for bid in root_bids]
         if roots_found:
             for r in roots_found:
-                st.error(f"🔴 `{r}` — direct evidence indicates implementation bug")
+                st.warning(f"`{r}` — model-ranked possible origin; inspect its evidence")
         else:
-            st.success("No root defects detected above threshold.")
+            st.info("No possible origins ranked above threshold; unchecked behavior remains unresolved.")
 
     with col_affected:
-        st.markdown("**Affected Callers (Re-verify after roots fixed):**")
+        st.markdown("**Potentially affected callers (Recheck dependencies):**")
         affected = [
             by_bid[bid].qualname
             for bid, bp in post.items()
@@ -398,17 +401,16 @@ with tab_map:
         ]
         if affected:
             for a in affected:
-                st.warning(f"🟡 `{a}` — output unreliable due to upstream dependencies")
+                st.warning(f"`{a}` — model trust reduced by dependency evidence")
         else:
             st.info("No collateral caller blocks affected.")
 
     st.subheader("Where the doubt comes from")
     st.caption(
-        "A block can look suspect for two very different reasons. **Own doubt** "
-        "means its own evidence is bad — that is a repair target. **Inherited "
-        "doubt** means it only looks bad because something it depends on is "
-        "broken — patching it would mask the real fault. The console report "
-        "and this chart keep them separate for that reason."
+        "**Own doubt** estimates a defect in this block. **Inherited doubt** "
+        "reduces trust because of dependency evidence. Investigate both the "
+        "block and its dependencies before choosing a patch; neither estimate "
+        "proves where the fault originates."
     )
     stacked = df.melt(
         id_vars=["block"],
@@ -476,10 +478,10 @@ with tab_map:
         color="band",
         hover_name="block",
         color_discrete_map={
-            "LIKELY OK": "#17becf",
+            "LOW REVIEW": "#17becf",
             "UNCERTAIN": "#bcbd22",
-            "SUSPECT": "#ff7f0e",
-            "CRITICAL": "#d62728",
+            "HIGH REVIEW": "#ff7f0e",
+            "TOP REVIEW": "#d62728",
         },
     )
     scat.add_vline(x=threshold, line_dash="dash", line_color="grey")

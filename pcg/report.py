@@ -12,11 +12,11 @@ from .inference import BlockPosterior, find_root_repairs, repair_targets, review
 
 # Risk bands drive both the console colours and the heat map.
 BANDS = [
-    (0.85, "LIKELY OK", "green"),
-    (0.65, "LIKELY OK", "cyan"),
+    (0.85, "LOW REVIEW", "green"),
+    (0.65, "LOW REVIEW", "cyan"),
     (0.45, "UNCERTAIN", "yellow"),
-    (0.25, "SUSPECT", "orange3"),
-    (0.00, "CRITICAL", "red"),
+    (0.25, "HIGH REVIEW", "orange3"),
+    (0.00, "TOP REVIEW", "red"),
 ]
 
 
@@ -24,7 +24,7 @@ def band_of(p: float) -> tuple[str, str]:
     for thresh, label, colour in BANDS:
         if p >= thresh:
             return label, colour
-    return "CRITICAL", "red"
+    return "TOP REVIEW", "red"
 
 
 def _console():
@@ -142,8 +142,8 @@ def render_console(
             )
             if bp.culpability < 0.10:
                 console.print(
-                    "    [dim]This block's own evidence is clean; it is "
-                    "suspect only via its dependencies. Fix those first.[/dim]"
+                    "    [dim]The model assigns little intrinsic doubt here; "
+                    "investigate its dependencies as possible causes.[/dim]"
                 )
 
     # -- targeted repair set & root analysis ---------------------------
@@ -159,7 +159,7 @@ def render_console(
     if not flagged and not repair_bids:
         console.print(
             f"[green]No block falls below threshold (all P(correct) >= {threshold:.2f} "
-            "and culpability < {threshold:.2f}). Full regeneration unnecessary.[/green]"
+            "and culpability < {threshold:.2f}). Unchecked behavior remains unresolved.[/green]"
         )
     else:
         total_loc = sum(b.loc for b in blocks)
@@ -183,7 +183,7 @@ def render_console(
         )
         if root_blocks:
             console.print(
-                "[bold red]ROOT DEFECTS (Fix these first — originating bugs):[/bold red]"
+                "[bold red]LIKELY ORIGINS (Investigate these first):[/bold red]"
             )
             for b, bp in sorted(root_blocks, key=lambda t: -t[1].culpability):
                 console.print(
@@ -194,7 +194,7 @@ def render_console(
                 )
         if cascade_repairs:
             console.print(
-                "\n[bold orange3]SECONDARY REPAIRS (Subordinate defective blocks):[/bold orange3]"
+                "\n[bold orange3]ADDITIONAL CANDIDATES (Inspect their own evidence):[/bold orange3]"
             )
             for b, bp in sorted(cascade_repairs, key=lambda t: -t[1].culpability):
                 console.print(
@@ -205,7 +205,7 @@ def render_console(
                 )
         if collateral:
             console.print(
-                "\n[bold yellow]AFFECTED CALLERS (Collateral only — re-verify after roots are fixed):[/bold yellow]"
+                "\n[bold yellow]POTENTIALLY AFFECTED CALLERS (Recheck dependencies):[/bold yellow]"
             )
             for b, bp in collateral:
                 console.print(
@@ -217,7 +217,7 @@ def render_console(
 
         root_loc = sum(b.loc for b, _ in root_blocks)
         console.print(
-            f"\n[dim]Root repairs touch only {root_loc}/{total_loc} lines "
+            f"\n[dim]Possible-origin blocks contain {root_loc}/{total_loc} lines "
             f"({100 * root_loc / max(total_loc, 1):.0f}%), leaving "
             f"{100 - 100 * root_loc / max(total_loc, 1):.0f}% of the program "
             f"untouched.[/dim]"
@@ -321,11 +321,10 @@ def write_html(path: str, source: str, blocks: list[Block], post, data: dict) ->
 
     owner = line_to_block(blocks)
     css_for = {
-        "SAFE": "#1a7f37",
-        "LIKELY OK": "#2da44e",
+        "LOW REVIEW": "#2da44e",
         "UNCERTAIN": "#bf8700",
-        "SUSPECT": "#d1662b",
-        "CRITICAL": "#cf222e",
+        "HIGH REVIEW": "#d1662b",
+        "TOP REVIEW": "#cf222e",
     }
 
     rows = []
@@ -393,6 +392,11 @@ def write_html(path: str, source: str, blocks: list[Block], post, data: dict) ->
             + html.escape(json.dumps(data["graph_testing"], indent=2))
             + "</pre></details>"
         )
+    plan_html += (
+        "<details open><summary>Observed findings and limits</summary><pre>"
+        + html.escape(json.dumps(data.get("findings", {}), indent=2))
+        + "</pre></details>"
+    )
     doc = f"""<!doctype html>
 <meta charset="utf-8">
 <title>Correctness Probability Map</title>
@@ -436,7 +440,7 @@ a proof of correctness.</div>
 <p class="sub" style="font-size:12px"><b>Own</b> = doubt originating from this
 block's own evidence. <b>Inh</b> = doubt inherited from its dependencies via
 constraint propagation. A block with high Inh but near-zero Own is not itself
-broken &mdash; fix its dependencies instead.</p>
+confirmed broken by that estimate; investigate its dependencies as well.</p>
 <h2 style="font-size:1.1rem">Source heat map</h2>
 <table><tbody>{"".join(rows)}</tbody></table>
 {diagnoses_html}

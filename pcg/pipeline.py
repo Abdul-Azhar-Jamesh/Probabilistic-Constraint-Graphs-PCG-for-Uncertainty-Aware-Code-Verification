@@ -80,6 +80,14 @@ class Analysis:
             data["control_flow_graph"] = self.graph.graph["test_targets"].to_dict()
         data["failure_diagnoses"] = self.failure_diagnoses
         data["failure_validation"] = self.failure_validation
+        from .findings import summarize_findings
+
+        data["findings"] = summarize_findings(
+            self.execution, self.evidence, self.failure_validation,
+            calibrated=data["inference"]["calibrated"],
+        )
+        if self.execution and not self.execution.valid:
+            data["automatic_validation"]["status"] = "incomplete"
         from .project import trace_diagnoses
 
         data["executed_diagnoses"] = trace_diagnoses(self.execution)

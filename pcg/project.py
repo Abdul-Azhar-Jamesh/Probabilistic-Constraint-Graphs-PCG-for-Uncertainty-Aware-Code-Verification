@@ -655,8 +655,14 @@ def analyze_project(
             }
         )
     ranking.sort(key=lambda r: (-r["defect_probability"], r["file"], r["line"]))
+    from .findings import summarize_findings
+
     return {
         "schema_version": 2,
+        "findings": summarize_findings(
+            result, evidence, validation, static=static,
+            calibrated=bundle.graph.graph["inference"]["calibrated"],
+        ),
         "mode": "project",
         "status": "no-executable-checks"
         if result.status == "no_tests"
@@ -822,6 +828,7 @@ def write_report(report: dict, json_path: str | None, html_path: str | None) -> 
         details = "".join(
             f"<details><summary>{html.escape(name)}</summary><pre>{html.escape(json.dumps(report[name], indent=2))}</pre></details>"
             for name in (
+                "findings",
                 "diagnoses",
                 "execution",
                 "static",

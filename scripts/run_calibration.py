@@ -1,9 +1,6 @@
-"""End-to-end calibration runner.
+"""Compatibility entry point for repository-disjoint pcg.validation.
 
-Generates the mutation corpus, builds the training set, fits models,
-validates on the holdout case, and saves all results.
-
-Run:  python scripts/run_calibration.py
+Run: python scripts/run_calibration.py --curated --execution local
 """
 
 import sys

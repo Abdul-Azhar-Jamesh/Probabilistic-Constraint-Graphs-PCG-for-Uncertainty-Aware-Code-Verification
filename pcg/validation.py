@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import networkx as nx
@@ -89,13 +90,20 @@ def collect_case(row: dict, execution: ExecutionConfig) -> dict:
     names = {block.qualname for block in blocks}
     if not set(row["unreliable"]) <= names:
         raise ValueError(f"unknown label in {row['name']}")
+    started = time.monotonic()
     result = run_tests(row["source"], row["tests"], execution)
     if not result.valid:
         raise ValueError(
             f"{row['name']}: incomplete test run ({result.status}, {result.errors})"
         )
     evidence = collect_all(row["source"], blocks, execution_result=result)
-    return {"case": row, "blocks": blocks, "evidence": evidence, "execution": result}
+    return {
+        "case": row,
+        "blocks": blocks,
+        "evidence": evidence,
+        "execution": result,
+        "seconds": time.monotonic() - started,
+    }
 
 
 def fit_sensor_model(cases: list[dict]) -> SensorModel:
@@ -223,6 +231,7 @@ def predict_cases(
                     "trust": posterior.posterior,
                     "defect": posterior.culpability,
                     "risk": posterior.risk,
+                    "seconds": case.get("seconds", 0),
                 }
             )
     return rows
@@ -244,6 +253,7 @@ def metrics(rows: list[dict], threshold: float = 0.5) -> dict:
         tp = sum(p < cut and y == 0 for p, y in zip(probabilities, labels))
         fp = sum(p < cut and y == 1 for p, y in zip(probabilities, labels))
         fn = sum(p >= cut and y == 0 for p, y in zip(probabilities, labels))
+        tn = sum(p >= cut and y == 1 for p, y in zip(probabilities, labels))
         precision = tp / max(1, tp + fp)
         recall = tp / max(1, tp + fn)
         return {
@@ -256,9 +266,27 @@ def metrics(rows: list[dict], threshold: float = 0.5) -> dict:
             "tp": tp,
             "fp": fp,
             "fn": fn,
+            "tn": tn,
+            "false_positive_rate": fp / max(1, fp + tn),
+            "reliability_bins": reliability_bins(probabilities, labels),
         }
 
-    ranked = sorted(rows, key=lambda row: -row["risk"])
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["case"], []).append(row)
+    # Localization ranks intrinsic defects inside each program, not unrelated
+    # blocks across repositories; clean cases cannot have a root-cause rank.
+    ranks = []
+    precisions = []
+    for group in groups.values():
+        ranked = sorted(group, key=lambda row: (-row["defect"], row["block"]))
+        if any(not row["correct"] for row in ranked):
+            ranks.append(
+                next(i for i, row in enumerate(ranked, 1) if not row["correct"])
+            )
+        precisions.append(
+            sum(1 - row["correct"] for row in ranked[:3]) / min(3, len(ranked))
+        )
     return {
         "blocks": len(rows),
         "repositories": len({r["repository"] for r in rows}),
@@ -268,7 +296,77 @@ def metrics(rows: list[dict], threshold: float = 0.5) -> dict:
         "defect": score(
             [1 - r["defect"] for r in rows], [r["correct"] for r in rows], 0.5
         ),
-        "precision_at_3": sum(1 - r["correct"] for r in ranked[:3]) / min(3, len(rows)),
+        "precision_at_3": float(np.mean(precisions)),
+        "localization": {
+            "buggy_cases": len(ranks),
+            "top_1": sum(r == 1 for r in ranks) / len(ranks) if ranks else None,
+            "top_3": sum(r <= 3 for r in ranks) / len(ranks) if ranks else None,
+            "mean_reciprocal_rank": float(np.mean([1 / r for r in ranks]))
+            if ranks
+            else None,
+            "interpretation": "Intrinsic-defect ranking per labelled buggy program; not exact-line causal proof.",
+        },
+    }
+
+
+def reliability_bins(
+    probabilities: list[float], labels: list[int], bins: int = 10
+) -> list[dict]:
+    """Include empty bins explicitly; endpoints 0 and 1 are both retained."""
+    result = []
+    for index in range(bins):
+        selected = [
+            (p, y)
+            for p, y in zip(probabilities, labels)
+            if min(int(p * bins), bins - 1) == index
+        ]
+        result.append(
+            {
+                "lower": index / bins,
+                "upper": (index + 1) / bins,
+                "count": len(selected),
+                "mean_probability": float(np.mean([p for p, _ in selected]))
+                if selected
+                else None,
+                "observed_frequency": float(np.mean([y for _, y in selected]))
+                if selected
+                else None,
+            }
+        )
+    return result
+
+
+def bootstrap_metrics(
+    rows: list[dict], threshold: float, repeats: int = 500, seed: int = 301
+) -> dict:
+    """Resample whole repositories, preserving correlated cases and blocks."""
+    repositories = sorted({r["repository"] for r in rows})
+    if len(repositories) < 2:
+        return {
+            "status": "insufficient-repositories",
+            "repositories": len(repositories),
+        }
+    rng = np.random.default_rng(seed)
+    samples: dict[str, list[float]] = {}
+    for _ in range(repeats):
+        selected = rng.choice(repositories, len(repositories), replace=True)
+        sample = [row for repo in selected for row in rows if row["repository"] == repo]
+        score = metrics(sample, threshold)
+        for scope in ("trust", "defect"):
+            for name in ("precision", "recall", "false_positive_rate", "brier", "ece"):
+                samples.setdefault(f"{scope}.{name}", []).append(score[scope][name])
+    return {
+        "status": "measured",
+        "repositories": len(repositories),
+        "repeats": repeats,
+        "seed": seed,
+        "unit": "repository",
+        "confidence": 0.95,
+        "percentile_intervals": {
+            key: np.quantile(value, [0.025, 0.975]).tolist()
+            for key, value in samples.items()
+        },
+        "limitation": "Few repositories yield unstable intervals; these do not establish deployment calibration.",
     }
 
 
@@ -333,15 +431,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument(
+        "--curated",
+        action="store_true",
+        help="independently specified synthetic bug/fix families",
+    )
     parser.add_argument("--execution", choices=["local", "docker"], default="docker")
     parser.add_argument("--out", type=Path, default=Path("out/validation"))
     parser.add_argument("--timeout", type=int, default=10)
     args = parser.parse_args()
-    if bool(args.dataset) == args.demo:
-        parser.error("choose exactly one of --dataset or --demo")
+    if sum((bool(args.dataset), args.demo, args.curated)) != 1:
+        parser.error("choose exactly one of --dataset, --demo or --curated")
+    from .evaluation_cases import curated_dataset
+
     dataset = (
         demo_dataset()
         if args.demo
+        else curated_dataset()
+        if args.curated
         else json.loads(args.dataset.read_text(encoding="utf-8"))
     )
     validate_dataset(dataset)
@@ -372,9 +479,11 @@ def main() -> None:
     model = SensorModel(
         model.likelihoods, model.prior_coefficients, False, threshold, model.provenance
     )
-    report = {
-        "scope": "synthetic smoke benchmark"
+    report: dict = {
+        "scope": "synthetic mutation smoke benchmark"
         if args.demo
+        else "independently specified synthetic families"
+        if args.curated
         else "user-labelled held-out repositories",
         "dataset_sha256": hashlib.sha256(
             json.dumps(dataset, sort_keys=True).encode()
@@ -393,7 +502,36 @@ def main() -> None:
             for variant in ("full", "without_graph", "tests_only", "static_only")
         },
         "default_model_test": metrics(predict_cases(test, SensorModel()), 0.5),
+        "test_uncertainty": bootstrap_metrics(predict_cases(test, model), threshold),
+        "test_predictions": predict_cases(test, model),
+        "case_outcomes": [
+            {
+                "case": c["case"]["name"],
+                "split": c["case"]["split"],
+                "labelled_buggy": bool(c["case"]["buggy"]),
+                "oracle_failure": bool(c["execution"].failed_ids),
+                "seconds": c["seconds"],
+            }
+            for c in cases
+        ],
         "calibration_claim": "Measured scores only; no automatic promotion to a calibrated deployment model.",
+    }
+    fitted_score = report["test"]["full"]
+    default_score = report["default_model_test"]
+    report["calibration_assessment"] = {
+        "deployment_model_changed": False,
+        "status": "insufficient-independent-real-world-data"
+        if args.demo or args.curated
+        else "held-out-measurements-only",
+        "brier_change_fitted_minus_default": {
+            name: fitted_score[name]["brier"] - default_score[name]["brier"]
+            for name in ("trust", "defect")
+        },
+        "ece_change_fitted_minus_default": {
+            name: fitted_score[name]["ece"] - default_score[name]["ece"]
+            for name in ("trust", "defect")
+        },
+        "interpretation": "Negative changes are better on this split. ECE depends on binning and sample size; review Brier, reliability bins, false alarms and repository intervals together. Neither metric proves deployment calibration.",
     }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "sensor_model.json").write_text(
@@ -402,7 +540,53 @@ def main() -> None:
     (args.out / "report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
-    print(json.dumps(report, indent=2))
+    lines = [
+        "# Probability and localization evaluation",
+        "",
+        report["scope"],
+        "",
+        "| Model | Target | Precision | Recall | False-positive rate | Brier | ECE |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for name, score in [("default", default_score), *report["test"].items()]:
+        for target in ("trust", "defect"):
+            values = score[target]
+            lines.append(
+                f"| {name} | {target} | "
+                + " | ".join(
+                    f"{values[key]:.4f}"
+                    for key in (
+                        "precision",
+                        "recall",
+                        "false_positive_rate",
+                        "brier",
+                        "ece",
+                    )
+                )
+                + " |"
+            )
+    lines.extend(
+        [
+            "",
+            "Defect scores evaluate intrinsic defects; trust scores evaluate labelled downstream unreliability.",
+            "",
+            "Localization is measured within each program. Inspect report.json for ranks, reliability bins, predictions and repository bootstrap intervals.",
+            "",
+            "No deployment model was changed. Synthetic families are not independent real-world repositories. Small-sample scores do not establish deployment calibration.",
+        ]
+    )
+    (args.out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "scope": report["scope"],
+                "threshold": threshold,
+                "calibration_assessment": report["calibration_assessment"],
+                "report": str(args.out / "report.json"),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
